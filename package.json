@@ -1,0 +1,33 @@
+{
+  "name": "postman-postbot-gateway",
+  "version": "0.1.0",
+  "description": "Unofficial local OpenAI and Anthropic compatibility gateway for Postman Agent/Postbot.",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "postman-postbot-gateway": "postman-gateway-macos.js"
+  },
+  "scripts": {
+    "start": "node postman-gateway-macos.js",
+    "check": "node --check postman-gateway-macos.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "postman",
+    "postbot",
+    "openai-compatible",
+    "anthropic-compatible",
+    "claude-code",
+    "gateway"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leefeee/postman-postbot-gateway.git"
+  },
+  "bugs": {
+    "url": "https://github.com/leefeee/postman-postbot-gateway/issues"
+  },
+  "homepage": "https://github.com/leefeee/postman-postbot-gateway#readme"
+}
