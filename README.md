@@ -7,53 +7,64 @@
 
 ## 中文
 
-Postman Postbot Gateway 是一个零依赖的 Node.js 本地网关。它读取本机 Postman 桌面客户端的登录信息，将 Postman Agent/Postbot 的真实响应转换成 OpenAI Chat Completions 和 Anthropic Messages 兼容格式。
+Postman Postbot Gateway 是一个零第三方依赖的 Node.js 本地网关。它读取本机 Postman 桌面端登录会话，把 Postman Agent 的真实响应转换成 Claude Code、Codex CLI 和 Trae 可以使用的 API 协议。
 
 ### 功能
 
-- 向 Postman 的真实 Agent Chat 服务发送请求，不返回模拟文本
-- 自动读取 macOS、Windows 和 Linux 上的 Postman 登录信息
-- 尝试从 Postman 客户端日志中自动识别最近使用的工作区
-- 从 Postman 配置接口动态获取账号实际可用的模型
-- 支持 OpenAI `/v1/chat/completions`
-- 支持 Anthropic `/v1/messages`
-- 支持两种协议的 SSE 流式输出
-- 支持 Anthropic `/v1/messages/count_tokens` 的兼容响应
-- 默认只监听 `127.0.0.1`
-- 不在日志中打印 Postman 登录令牌
+- 真实转发到 `gateway.postman.com/chat`，不返回模拟文本
+- 支持 Anthropic Messages `/v1/messages`，可接入 Claude Code
+- 支持 OpenAI Responses `/v1/responses`，可接入 Codex CLI
+- 支持 OpenAI Chat Completions `/v1/chat/completions`，可接入 Trae 等客户端
+- 转换 Anthropic `tool_use` / `tool_result`
+- 转换 OpenAI `tool_calls` / `role=tool`
+- 转换 Responses `function_call` / `function_call_output`
+- 将客户端工具动态注入 Postman Agent，再把工具结果作为分组 `toolResponse` 回传
+- 审批由 Claude Code、Codex 或 Trae 自己处理；拒绝结果会转换为 Postman `REJECTED / EXPLICIT`
+- 保存并复用 Postman `conversationId`，客户端后续只向 Postman发送增量消息
+- 避免把客户端完整历史反复拼入 Postman `query`，解决首次对话的 `Chat input too large`
+- 支持普通响应和 SSE 流式响应
+- 自动读取 Postman 登录信息、工作区和账号实际可用模型
+- 默认只监听 `127.0.0.1`，日志不输出令牌和完整提示词
 
-### 已知限制
-
-- 使用的是 Postman 桌面客户端未公开的内部接口，Postman 更新后可能失效。
-- 当前只转换文本内容，不支持 `tool_use` / `tool_result`。Claude Code 可以进行文本对话，但无法通过此网关调用本地文件、Shell 等工具。
-- 不支持 OpenAI Responses API `/v1/responses`，因此当前不能直接用于 Codex CLI。
-- 图片会被替换成文字占位符，不会发送到 Postman。
-- 每次兼容 API 请求都会创建一个新的 Postman 会话。
-- 使用量和可用模型由你的 Postman 账号、团队方案和管理员策略决定。
-
-### 环境要求
-
-- Node.js 20 或更高版本
-- 已安装 Postman 桌面客户端
-- 已在 Postman 中登录
-- 账号已获得 Postman Agent/Postbot 使用权限
-
-目前已在以下环境验证：
+### 已验证环境
 
 - macOS Apple Silicon
 - Postman 12.23.1
 - Node.js 22
-- Claude Code 2.1.226
+- Claude Code 2.1.226：首次完整系统提示、文本对话、Bash 工具调用与结果回传
+- Codex CLI 0.147.0：Responses API、shell 工具调用与结果回传
+- OpenAI Chat Completions：文本、工具调用、工具成功/失败/拒绝回传
+
+Trae 使用的就是 OpenAI Chat Completions 通路。项目已完成该协议的端到端工具闭环；不同 Trae 版本的模型配置界面可能略有差异。
+
+### 工作原理
+
+```text
+Claude Code / Codex CLI / Trae
+             │
+             ▼
+   127.0.0.1:9887 本地网关
+             │
+             ├── 识别客户端会话和最新增量消息
+             ├── 把客户端工具定义注入 Postman Agent
+             ├── 保存 conversationId 与工具调用组
+             └── 转换工具调用、审批结果和 toolResponse
+             │
+             ▼
+    gateway.postman.com/chat
+```
+
+模型需要工具时，网关不会替客户端执行工具。它把工具调用返回给 Claude Code、Codex 或 Trae，由客户端显示审批并在本机执行；随后网关把执行结果连同原来的 `conversationId`、`toolCallGroupId` 和 `toolCallId` 发回 Postman，让 Agent 继续回答。
 
 ### 安装
 
 ```bash
 git clone https://github.com/leefeee/postman-postbot-gateway.git
 cd postman-postbot-gateway
-npm run check
+npm test
 ```
 
-本项目没有第三方运行时依赖，不需要执行 `npm install`。
+项目没有第三方运行时依赖，不需要执行 `npm install`。要求 Node.js 20 或更高版本，并且 Postman 桌面端已经登录且有 Agent/Postbot 权限。
 
 ### 启动
 
@@ -61,24 +72,26 @@ npm run check
 npm start
 ```
 
-默认监听：
+默认地址：
 
 ```text
 http://127.0.0.1:9887
 ```
 
-查看帮助：
-
-```bash
-node postman-gateway-macos.js --help
-```
-
-如果无法自动识别工作区，可以手动指定：
+如果无法自动识别工作区：
 
 ```bash
 node postman-gateway-macos.js \
   --workspace-id "YOUR_POSTMAN_WORKSPACE_UUID"
 ```
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:9887/
+```
+
+返回结果中的 `capabilities` 应显示会话、工具调用、toolResponse 和三种客户端协议均为 `true`。
 
 ### 配置选项
 
@@ -88,8 +101,14 @@ node postman-gateway-macos.js \
 | `--host`, `-H` | `HOST` | `127.0.0.1` | 绑定地址 |
 | `--postman-data-dir`, `-d` | `POSTMAN_DATA_DIR` | 系统默认目录 | Postman 用户数据目录 |
 | `--workspace-id`, `-w` | `POSTMAN_WORKSPACE_ID` | 自动识别 | Postman 工作区 UUID |
-| — | `POSTMAN_APP_VERSION` | 本地版本 | 覆盖 Postman 客户端版本 |
-| — | `POSTMAN_GATEWAY_URL` | `https://gateway.postman.com` | 上游地址，仅用于调试 |
+| — | `POSTMAN_APP_VERSION` | 本地版本 | 覆盖 Postman 版本 |
+| — | `POSTMAN_GATEWAY_URL` | `https://gateway.postman.com` | 调试用上游地址 |
+| — | `POSTMAN_GATEWAY_STATE_FILE` | `~/.postman-postbot-gateway/sessions.json` | 会话映射缓存 |
+| — | `POSTMAN_SESSION_TTL_MS` | `43200000` | 会话缓存有效期，默认 12 小时 |
+| — | `POSTMAN_MAX_QUERY_CHARS` | `9800` | Postman 单次 `query` 安全上限 |
+| — | `POSTMAN_GATEWAY_DEBUG` | `0` | 设为 `1` 输出协议诊断日志 |
+| — | `POSTMAN_CLIENT_TOOLS_HASH` | 自动 | Postman 更新后手动覆盖工具版本哈希 |
+| — | `POSTMAN_KB_TERMS_HASH` | 自动 | Postman 更新后手动覆盖知识条目哈希 |
 
 Postman 默认数据目录：
 
@@ -101,65 +120,24 @@ Postman 默认数据目录：
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/` | 健康状态 |
-| `GET` | `/v1/models` | 账号实际可用模型与使用量 |
-| `POST` | `/v1/chat/completions` | OpenAI Chat Completions 兼容接口 |
-| `POST` | `/v1/messages` | Anthropic Messages 兼容接口 |
-| `POST` | `/v1/messages/count_tokens` | 估算输入 token 数 |
+| `GET` | `/` | 健康状态与能力列表 |
+| `GET` | `/v1/models` | 可用模型与账号用量 |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions / Trae |
+| `POST` | `/v1/messages` | Anthropic Messages / Claude Code |
+| `POST` | `/v1/messages/count_tokens` | Anthropic Token Count |
+| `POST` | `/v1/responses` | OpenAI Responses / Codex CLI |
 
-查看模型：
+查询模型：
 
 ```bash
 curl http://127.0.0.1:9887/v1/models
 ```
 
-OpenAI 格式：
+`postbot`、`default` 和 `auto` 会使用 Postman 的默认模型。也可以传入接口返回的真实模型 key 或显示名称。
 
-```bash
-curl http://127.0.0.1:9887/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "postbot",
-    "messages": [
-      {"role": "user", "content": "只回复 OK"}
-    ]
-  }'
-```
+### Claude Code 配置
 
-OpenAI 流式格式：
-
-```bash
-curl -N http://127.0.0.1:9887/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "postbot",
-    "stream": true,
-    "messages": [
-      {"role": "user", "content": "只回复 OK"}
-    ]
-  }'
-```
-
-Anthropic 格式：
-
-```bash
-curl http://127.0.0.1:9887/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "anthropic-version: 2023-06-01" \
-  -d '{
-    "model": "postbot",
-    "max_tokens": 100,
-    "messages": [
-      {"role": "user", "content": "只回复 OK"}
-    ]
-  }'
-```
-
-`postbot`、`default` 和 `auto` 会使用 Postman 返回的默认模型。也可以先查询 `/v1/models`，再传入真实模型 key 或显示名称。
-
-### Claude Code
-
-建议先使用一次性配置，避免覆盖现有设置：
+先用一次性配置测试：
 
 ```bash
 claude \
@@ -167,108 +145,154 @@ claude \
   --settings '{
     "env": {
       "ANTHROPIC_BASE_URL": "http://127.0.0.1:9887",
+      "ANTHROPIC_API_KEY": "local-postman-gateway",
       "ANTHROPIC_AUTH_TOKEN": "local-postman-gateway",
       "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
     }
   }'
 ```
 
-`ANTHROPIC_AUTH_TOKEN` 可以填写任意非空字符串；本地网关不会使用它。真正的上游认证信息从 Postman 本地数据中读取。
+注意：Claude Code 的 `ANTHROPIC_BASE_URL` 必须是 `http://127.0.0.1:9887`，末尾不要加 `/v1`。本地 API Key 可以填写任意非空字符串，网关真正使用的是 Postman 桌面端会话。
+
+长期使用时，把上面的 `env` 合并到 `~/.claude/settings.json`，启动时使用：
+
+```bash
+claude --model postbot
+```
+
+Claude Code 收到 `tool_use` 后仍会遵守自己的 permission mode、`allowedTools` 和 `disallowedTools`。网关不会绕过审批。
+
+### Codex CLI 配置
+
+在 `~/.codex/config.toml` 中加入：
+
+```toml
+model = "postbot"
+model_provider = "postman"
+
+[model_providers.postman]
+name = "Postman Gateway"
+base_url = "http://127.0.0.1:9887/v1"
+env_key = "POSTMAN_GATEWAY_API_KEY"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+```
+
+再设置一个任意非空的本地占位 Key：
+
+```bash
+export POSTMAN_GATEWAY_API_KEY="local-postman-gateway"
+codex
+```
+
+Codex 必须使用 Responses API，所以这里的 `base_url` 需要包含 `/v1`。Codex 的 sandbox 和 approval 配置继续生效，shell、文件修改等工具都由 Codex 本地执行。
+
+### Trae 配置
+
+在 Trae 的自定义模型中填写：
+
+| 配置项 | 值 |
+| --- | --- |
+| API 格式 | OpenAI Chat Completions |
+| 自定义请求地址 | `http://127.0.0.1:9887/v1` |
+| 完整 URL | 关闭 |
+| 模型 ID | `postbot`，或 `/v1/models` 返回的真实模型 |
+| API 密钥 | 任意非空字符串 |
+
+Trae 会自动在地址后补 `/chat/completions`。不要同时打开“完整 URL”并填写 `/v1`，否则可能拼出错误路径。
+
+### 会话与输入上限
+
+Postman `/chat` 的 `input.query` 存在约 10,000 字符的硬上限，这和模型上下文窗口不是一回事。旧版本把系统提示和完整历史全部拼进 `query`，因此 Claude Code 或 Trae 第一次只说“你好”也可能报错。
+
+当前版本会：
+
+1. 第一次请求只发送客户端系统提示和当前用户消息，并控制在安全上限内。
+2. 保存 Postman 返回的 `conversationId`。
+3. 后续请求只发送新增用户消息；Postman 通过服务端会话保留历史。
+4. 工具结果通过 `TOOL_RESPONSE` 单独回传，不再塞回普通文本历史。
+
+如果单条用户消息本身超过安全上限，网关会保留尾部并明确标记截断。图片和文件二进制目前不会转发，只会生成文字占位符。
+
+### 已知限制
+
+- Postman Agent 接口、产品标识和客户端哈希都不是公开 API，Postman 更新后可能变化。
+- Agent 工具模式目前在 macOS Postman 12.23.1 上完成真实验证；其他版本可通过两个哈希环境变量适配。
+- 网关只注入调用方提供的工具，不会直接开放 Postman 桌面端内部工具。
+- 图片和文件二进制输入尚未转发给 Postman。
+- 会话缓存在本机且默认 12 小时过期；清除缓存或跨机器后，未完成的工具调用不能继续。
+- 用量、模型和功能权限由 Postman 账号、团队方案及管理员策略决定。
 
 ### 安全说明
 
 - 只在你拥有或获准使用的 Postman 账号上运行。
-- 保持默认的 `127.0.0.1`，不要将网关直接暴露到局域网或公网。
+- 保持默认 `127.0.0.1`，不要直接暴露到局域网或公网。
 - 不要提交 Postman 的 `userPartitionData.json`、令牌、日志或完整用户数据目录。
-- 本地兼容接口目前不校验传入的 API Key；同一台机器上的其他进程可能调用它。
-- Postman 令牌通常拥有比 AI 对话更广的账号权限，请像对待密码一样保护它。
-- 使用本项目之前，请自行确认符合 Postman 的服务条款、团队政策及适用法律。
+- 兼容接口不校验传入的占位 API Key，同一台机器上的其他进程可能调用网关。
+- Postman 桌面端令牌可能拥有比 AI 对话更广的账号权限，请像密码一样保护。
+- 使用前请自行确认符合 Postman 服务条款、团队政策和适用法律。
 
-### 工作原理
+### 测试
 
-```text
-OpenAI / Anthropic 客户端
-            │
-            ▼
-  127.0.0.1:9887 本地网关
-            │
-            ├── 读取本机 Postman 登录信息
-            ├── 将请求转换为 Postman Agent Chat 格式
-            └── 将 Postman SSE 转换回兼容协议
-            │
-            ▼
-   gateway.postman.com/chat
+```bash
+npm run check
+npm test
 ```
+
+自动化测试覆盖输入上限、三种工具定义、三种工具结果、分组 toolResponse、拒绝审批和 Responses function call。
 
 ### License
 
 [MIT](LICENSE)
+
 ---
 
 ## English
 
-Postman Postbot Gateway is a zero-dependency local Node.js gateway. It reads the signed-in Postman desktop session, sends requests to Postman's real Agent/Postbot service, and converts the responses into OpenAI Chat Completions and Anthropic Messages compatible formats.
+Postman Postbot Gateway is a zero-third-party-dependency Node.js gateway. It reads the signed-in Postman desktop session and translates real Postman Agent responses into protocols understood by Claude Code, Codex CLI, and Trae.
 
 ### Features
 
-- Sends real requests to Postman Agent Chat instead of returning mock text
-- Reads Postman desktop session data on macOS, Windows, and Linux
-- Attempts to detect the most recently used Postman workspace from local logs
-- Fetches the models actually available to the signed-in Postman account
-- Supports OpenAI `/v1/chat/completions`
-- Supports Anthropic `/v1/messages`
-- Supports SSE streaming for both compatibility APIs
-- Provides an Anthropic-compatible `/v1/messages/count_tokens` response
-- Binds to `127.0.0.1` by default
-- Never prints the Postman access token to logs
+- Real forwarding to `gateway.postman.com/chat`; no mock responses
+- Anthropic Messages `/v1/messages` for Claude Code
+- OpenAI Responses `/v1/responses` for Codex CLI
+- OpenAI Chat Completions `/v1/chat/completions` for Trae and compatible clients
+- Anthropic `tool_use` / `tool_result` translation
+- OpenAI `tool_calls` / `role=tool` translation
+- Responses `function_call` / `function_call_output` translation
+- Dynamic injection of client tools into Postman Agent
+- Grouped Postman `toolResponse` continuation with the original conversation and tool-call group
+- Client-side approvals remain enforced; rejected calls become Postman `REJECTED / EXPLICIT` responses
+- Persistent `conversationId` mapping and incremental user messages
+- Avoids replaying the full client history into Postman's approximately 10,000-character `query` field
+- Non-streaming and SSE streaming responses
+- Automatic Postman login, workspace, and model discovery
+- Localhost-only binding by default; tokens and full prompts are never logged
 
-### Known limitations
+### Verified environment
 
-- This project relies on an undocumented Postman desktop endpoint and may stop working after an update.
-- Only text responses are translated. `tool_use` and `tool_result` are not supported. Claude Code can chat through the gateway, but it cannot use local filesystem or shell tools through it.
-- The OpenAI Responses API `/v1/responses` is not implemented, so Codex CLI is not currently supported.
-- Image inputs are replaced with a text placeholder and are not forwarded.
-- Each compatibility request creates a new Postman conversation.
-- Available models and usage limits depend on the Postman account, team plan, and administrator policy.
+- macOS on Apple Silicon
+- Postman 12.23.1
+- Node.js 22
+- Claude Code 2.1.226: full first-turn prompt, text, Bash call, and tool-result continuation
+- Codex CLI 0.147.0: Responses API, local shell call, and tool-result continuation
+- OpenAI Chat Completions: text, tool calls, successful, failed, and rejected tool results
 
-### Requirements
+Trae uses the same OpenAI Chat Completions path. The protocol has been verified end to end, although labels in Trae's model settings may vary by release.
 
-- Node.js 20 or newer
-- Postman desktop installed
-- A signed-in Postman account
-- Access to Postman Agent/Postbot on that account
-
-Tested with macOS on Apple Silicon, Postman 12.23.1, Node.js 22, and Claude Code 2.1.226.
-
-### Installation
+### Install and start
 
 ```bash
 git clone https://github.com/leefeee/postman-postbot-gateway.git
 cd postman-postbot-gateway
-npm run check
-```
-
-There are no third-party runtime dependencies, so `npm install` is not required.
-
-### Start the gateway
-
-```bash
+npm test
 npm start
 ```
 
-The default address is:
+Node.js 20 or newer is required. Postman desktop must be installed, signed in, and authorized to use Agent/Postbot. No `npm install` is required.
 
-```text
-http://127.0.0.1:9887
-```
-
-Show all options:
-
-```bash
-node postman-gateway-macos.js --help
-```
-
-If workspace detection fails, specify it explicitly:
+The default address is `http://127.0.0.1:9887`. If workspace detection fails:
 
 ```bash
 node postman-gateway-macos.js \
@@ -279,12 +303,16 @@ node postman-gateway-macos.js \
 
 | CLI option | Environment variable | Default | Description |
 | --- | --- | --- | --- |
-| `--port`, `-p` | `PORT` | `9887` | Local listening port |
+| `--port`, `-p` | `PORT` | `9887` | Local port |
 | `--host`, `-H` | `HOST` | `127.0.0.1` | Bind address |
-| `--postman-data-dir`, `-d` | `POSTMAN_DATA_DIR` | OS default | Postman user data directory |
+| `--postman-data-dir`, `-d` | `POSTMAN_DATA_DIR` | OS default | Postman data directory |
 | `--workspace-id`, `-w` | `POSTMAN_WORKSPACE_ID` | Auto-detected | Postman workspace UUID |
-| — | `POSTMAN_APP_VERSION` | Local version | Override the Postman app version |
-| — | `POSTMAN_GATEWAY_URL` | `https://gateway.postman.com` | Upstream URL for debugging only |
+| — | `POSTMAN_GATEWAY_STATE_FILE` | `~/.postman-postbot-gateway/sessions.json` | Session mapping cache |
+| — | `POSTMAN_SESSION_TTL_MS` | `43200000` | Session TTL, 12 hours |
+| — | `POSTMAN_MAX_QUERY_CHARS` | `9800` | Safe Postman query limit |
+| — | `POSTMAN_GATEWAY_DEBUG` | `0` | Protocol diagnostics when set to `1` |
+| — | `POSTMAN_CLIENT_TOOLS_HASH` | Auto | Override after a Postman update |
+| — | `POSTMAN_KB_TERMS_HASH` | Auto | Override after a Postman update |
 
 Default Postman data directories:
 
@@ -292,69 +320,22 @@ Default Postman data directories:
 - Windows: `%APPDATA%\Postman`
 - Linux: `${XDG_CONFIG_HOME:-~/.config}/Postman`
 
-### API
+### Endpoints
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/` | Health status |
-| `GET` | `/v1/models` | Available models and account usage |
-| `POST` | `/v1/chat/completions` | OpenAI Chat Completions compatibility |
-| `POST` | `/v1/messages` | Anthropic Messages compatibility |
-| `POST` | `/v1/messages/count_tokens` | Estimated input token count |
+| `GET` | `/` | Health and capabilities |
+| `GET` | `/v1/models` | Available models and usage |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions / Trae |
+| `POST` | `/v1/messages` | Anthropic Messages / Claude Code |
+| `POST` | `/v1/messages/count_tokens` | Anthropic token estimate |
+| `POST` | `/v1/responses` | OpenAI Responses / Codex CLI |
 
-List models:
-
-```bash
-curl http://127.0.0.1:9887/v1/models
-```
-
-OpenAI-compatible request:
-
-```bash
-curl http://127.0.0.1:9887/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "postbot",
-    "messages": [
-      {"role": "user", "content": "Reply with OK only"}
-    ]
-  }'
-```
-
-OpenAI-compatible streaming request:
-
-```bash
-curl -N http://127.0.0.1:9887/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "postbot",
-    "stream": true,
-    "messages": [
-      {"role": "user", "content": "Reply with OK only"}
-    ]
-  }'
-```
-
-Anthropic-compatible request:
-
-```bash
-curl http://127.0.0.1:9887/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "anthropic-version: 2023-06-01" \
-  -d '{
-    "model": "postbot",
-    "max_tokens": 100,
-    "messages": [
-      {"role": "user", "content": "Reply with OK only"}
-    ]
-  }'
-```
-
-`postbot`, `default`, and `auto` use the default model returned by Postman. Query `/v1/models` to use a specific real model key or display name.
+`postbot`, `default`, and `auto` select Postman's default model. Query `/v1/models` to use a real model key or display name.
 
 ### Claude Code
 
-Use a one-off settings override first so your existing configuration stays untouched:
+Test with a one-off override:
 
 ```bash
 claude \
@@ -362,37 +343,84 @@ claude \
   --settings '{
     "env": {
       "ANTHROPIC_BASE_URL": "http://127.0.0.1:9887",
+      "ANTHROPIC_API_KEY": "local-postman-gateway",
       "ANTHROPIC_AUTH_TOKEN": "local-postman-gateway",
       "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
     }
   }'
 ```
 
-`ANTHROPIC_AUTH_TOKEN` may contain any non-empty value. The local gateway ignores it and reads the real upstream session from the Postman desktop data directory.
+Do not append `/v1` to `ANTHROPIC_BASE_URL`. The placeholder key may be any non-empty string. Claude Code still enforces its own permission mode and tool allow/deny rules.
+
+### Codex CLI
+
+Add this to `~/.codex/config.toml`:
+
+```toml
+model = "postbot"
+model_provider = "postman"
+
+[model_providers.postman]
+name = "Postman Gateway"
+base_url = "http://127.0.0.1:9887/v1"
+env_key = "POSTMAN_GATEWAY_API_KEY"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+```
+
+Then:
+
+```bash
+export POSTMAN_GATEWAY_API_KEY="local-postman-gateway"
+codex
+```
+
+Codex requires the Responses wire API, so its `base_url` includes `/v1`. Codex remains responsible for sandboxing, approvals, and local tool execution.
+
+### Trae
+
+| Setting | Value |
+| --- | --- |
+| API format | OpenAI Chat Completions |
+| Custom base URL | `http://127.0.0.1:9887/v1` |
+| Full URL | Off |
+| Model ID | `postbot` or a model returned by `/v1/models` |
+| API key | Any non-empty string |
+
+Trae appends `/chat/completions` automatically when Full URL is off.
+
+### Conversation and tool flow
+
+Postman's `/chat` endpoint limits `input.query` to approximately 10,000 characters. That is a request-field limit, not the model context window. The previous gateway replayed system instructions and the entire history into that field, so even a first “hello” from an agent client could fail.
+
+The current gateway sends the first system instructions plus the current user turn within a safe limit, stores the returned `conversationId`, sends only new user turns afterward, and returns tool outputs through Postman's dedicated `TOOL_RESPONSE` contract.
+
+Tools are never executed by the gateway. Claude Code, Codex, or Trae receives the call, applies its own approval policy, executes locally, and returns the result. The gateway then continues the same Postman conversation.
+
+### Known limitations
+
+- This relies on an undocumented Postman Agent API and private client metadata that may change.
+- Agent tool mode has been verified on macOS with Postman 12.23.1. Other releases may require hash overrides.
+- Only tools supplied by the calling client are injected; Postman's internal desktop tools are not exposed directly.
+- Binary image and file inputs are currently represented by text placeholders.
+- Session mappings expire after 12 hours by default. Pending tool calls cannot resume after their mapping is removed.
+- Models, quotas, and features depend on the Postman account and organization policy.
 
 ### Security
 
-- Run this project only with a Postman account you own or are authorized to use.
-- Keep the default `127.0.0.1` bind address. Do not expose the gateway directly to a LAN or the public internet.
-- Never commit `userPartitionData.json`, Postman tokens, logs, or the complete Postman user data directory.
-- The compatibility endpoints do not validate incoming API keys. Other processes on the same machine may be able to call the gateway.
-- A Postman desktop token may grant permissions beyond AI chat. Protect it like a password.
-- Before use, make sure the project complies with Postman's terms, your organization policies, and applicable law.
+- Use only a Postman account you own or are authorized to use.
+- Keep the default `127.0.0.1` binding; do not expose this gateway directly to a LAN or the public internet.
+- Never commit Postman session files, tokens, logs, or the entire data directory.
+- Placeholder API keys are not validated by the gateway, so other local processes may call it.
+- Treat the Postman desktop token like a password.
+- Confirm compliance with Postman's terms, organization policies, and applicable law.
 
-### How it works
+### Test
 
-```text
-OpenAI / Anthropic client
-           │
-           ▼
-  Local gateway on 127.0.0.1:9887
-           │
-           ├── reads the local Postman desktop session
-           ├── converts requests to Postman Agent Chat
-           └── converts Postman SSE back to a compatible protocol
-           │
-           ▼
-   gateway.postman.com/chat
+```bash
+npm run check
+npm test
 ```
 
 ### License
