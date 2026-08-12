@@ -342,21 +342,31 @@ function externalSessionKeys(payload, req) {
 function extractToolResults(payload, protocol) {
   const results = [];
   if (protocol === 'anthropic') {
-    for (const message of payload.messages || []) {
-      if (message.role !== 'user' || !Array.isArray(message.content)) continue;
-      for (const block of message.content) {
-        if (block?.type === 'tool_result' && block.tool_use_id) {
-          results.push({
-            callId: block.tool_use_id,
-            content: contentToText(block.content),
-            isError: block.is_error === true
-          });
-        }
+    // Anthropic clients replay the complete conversation on every request.
+    // Only tool_result blocks in the final user turn are new results; older
+    // blocks are history and have already been sent to Postman.
+    const message = Array.isArray(payload.messages) ? payload.messages.at(-1) : null;
+    if (message?.role !== 'user' || !Array.isArray(message.content)) return results;
+    for (const block of message.content) {
+      if (block?.type === 'tool_result' && block.tool_use_id) {
+        results.push({
+          callId: block.tool_use_id,
+          content: contentToText(block.content),
+          isError: block.is_error === true
+        });
       }
     }
   } else if (protocol === 'openai') {
-    for (const message of payload.messages || []) {
-      if (message.role === 'tool' && message.tool_call_id) {
+    // Chat Completions represents parallel results as one or more consecutive
+    // role=tool messages at the end of the current turn.
+    const trailing = [];
+    const messages = Array.isArray(payload.messages) ? payload.messages : [];
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index]?.role !== 'tool') break;
+      trailing.unshift(messages[index]);
+    }
+    for (const message of trailing) {
+      if (message.tool_call_id) {
         results.push({
           callId: message.tool_call_id,
           content: contentToText(message.content),
@@ -365,8 +375,15 @@ function extractToolResults(payload, protocol) {
       }
     }
   } else if (protocol === 'responses' && Array.isArray(payload.input)) {
-    for (const item of payload.input) {
-      if (item?.type === 'function_call_output' && item.call_id) {
+    // Responses clients may resend all previous input/output items. Only the
+    // trailing function_call_output items belong to the current continuation.
+    const trailing = [];
+    for (let index = payload.input.length - 1; index >= 0; index -= 1) {
+      if (payload.input[index]?.type !== 'function_call_output') break;
+      trailing.unshift(payload.input[index]);
+    }
+    for (const item of trailing) {
+      if (item.call_id) {
         results.push({
           callId: item.call_id,
           content: contentToText(item.output),

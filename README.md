@@ -22,6 +22,7 @@ Postman Postbot Gateway 是一个零第三方依赖的 Node.js 本地网关。�
 - 审批由 Claude Code、Codex 或 Trae 自己处理；拒绝结果会转换为 Postman `REJECTED / EXPLICIT`
 - 保存并复用 Postman `conversationId`，客户端后续只向 Postman发送增量消息
 - 避免把客户端完整历史反复拼入 Postman `query`，解决首次对话的 `Chat input too large`
+- 区分当前轮和历史工具结果，避免下一次普通提问重复提交旧 `tool_result`
 - 支持普通响应和 SSE 流式响应
 - 自动读取 Postman 登录信息、工作区和账号实际可用模型
 - 默认只监听 `127.0.0.1`，日志不输出令牌和完整提示词
@@ -212,6 +213,7 @@ Postman `/chat` 的 `input.query` 存在约 10,000 字符的硬上限，这和�
 2. 保存 Postman 返回的 `conversationId`。
 3. 后续请求只发送新增用户消息；Postman 通过服务端会话保留历史。
 4. 工具结果通过 `TOOL_RESPONSE` 单独回传，不再塞回普通文本历史。
+5. Claude Code、Codex 和 Trae 重放完整历史时，网关只处理当前轮尾部的新工具结果。
 
 如果单条用户消息本身超过安全上限，网关会保留尾部并明确标记截断。图片和文件二进制目前不会转发，只会生成文字占位符。
 
@@ -240,7 +242,7 @@ npm run check
 npm test
 ```
 
-自动化测试覆盖输入上限、三种工具定义、三种工具结果、分组 toolResponse、拒绝审批和 Responses function call。
+自动化测试覆盖输入上限、三种工具定义、三种工具结果、历史结果重放、并行结果、分组 toolResponse、拒绝审批和 Responses function call。
 
 ### License
 
@@ -266,6 +268,7 @@ Postman Postbot Gateway is a zero-third-party-dependency Node.js gateway. It rea
 - Client-side approvals remain enforced; rejected calls become Postman `REJECTED / EXPLICIT` responses
 - Persistent `conversationId` mapping and incremental user messages
 - Avoids replaying the full client history into Postman's approximately 10,000-character `query` field
+- Distinguishes current-turn tool outputs from historical outputs replayed by agent clients
 - Non-streaming and SSE streaming responses
 - Automatic Postman login, workspace, and model discovery
 - Localhost-only binding by default; tokens and full prompts are never logged
@@ -394,7 +397,7 @@ Trae appends `/chat/completions` automatically when Full URL is off.
 
 Postman's `/chat` endpoint limits `input.query` to approximately 10,000 characters. That is a request-field limit, not the model context window. The previous gateway replayed system instructions and the entire history into that field, so even a first “hello” from an agent client could fail.
 
-The current gateway sends the first system instructions plus the current user turn within a safe limit, stores the returned `conversationId`, sends only new user turns afterward, and returns tool outputs through Postman's dedicated `TOOL_RESPONSE` contract.
+The current gateway sends the first system instructions plus the current user turn within a safe limit, stores the returned `conversationId`, sends only new user turns afterward, and returns tool outputs through Postman's dedicated `TOOL_RESPONSE` contract. When a client replays its full history, only trailing tool outputs from the current turn are processed; completed historical outputs are ignored.
 
 Tools are never executed by the gateway. Claude Code, Codex, or Trae receives the call, applies its own approval policy, executes locally, and returns the result. The gateway then continues the same Postman conversation.
 

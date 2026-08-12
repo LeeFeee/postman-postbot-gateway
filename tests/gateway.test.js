@@ -45,6 +45,55 @@ test('tool results are recognized in all three client protocols', () => {
   ]);
 });
 
+test('historical tool results are ignored after a new user turn', () => {
+  assert.deepEqual(extractToolResults({ messages: [
+    { role: 'user', content: 'run a tool' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'an-old', name: 'shell', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'an-old', content: 'done' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'finished' }] },
+    { role: 'user', content: 'now answer a different question' }
+  ] }, 'anthropic'), []);
+
+  assert.deepEqual(extractToolResults({ messages: [
+    { role: 'user', content: 'run a tool' },
+    { role: 'assistant', tool_calls: [{ id: 'oa-old', type: 'function', function: { name: 'shell', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'oa-old', content: 'done' },
+    { role: 'assistant', content: 'finished' },
+    { role: 'user', content: 'now answer a different question' }
+  ] }, 'openai'), []);
+
+  assert.deepEqual(extractToolResults({ input: [
+    { role: 'user', content: 'run a tool' },
+    { type: 'function_call', call_id: 'rs-old', name: 'shell', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'rs-old', output: 'done' },
+    { role: 'assistant', content: [{ type: 'output_text', text: 'finished' }] },
+    { role: 'user', content: 'now answer a different question' }
+  ] }, 'responses'), []);
+});
+
+test('parallel tool results are read only from the trailing current turn', () => {
+  assert.deepEqual(extractToolResults({ messages: [
+    { role: 'tool', tool_call_id: 'old', content: 'historical' },
+    { role: 'assistant', content: 'previous answer' },
+    { role: 'assistant', tool_calls: [] },
+    { role: 'tool', tool_call_id: 'new-1', content: 'one' },
+    { role: 'tool', tool_call_id: 'new-2', content: 'two', is_error: true }
+  ] }, 'openai'), [
+    { callId: 'new-1', content: 'one', isError: false },
+    { callId: 'new-2', content: 'two', isError: true }
+  ]);
+
+  assert.deepEqual(extractToolResults({ input: [
+    { type: 'function_call_output', call_id: 'old', output: 'historical' },
+    { role: 'user', content: 'new turn' },
+    { type: 'function_call_output', call_id: 'new-1', output: 'one' },
+    { type: 'function_call_output', call_id: 'new-2', output: 'two', status: 'failed' }
+  ] }, 'responses'), [
+    { callId: 'new-1', content: 'one', isError: false },
+    { callId: 'new-2', content: 'two', isError: true }
+  ]);
+});
+
 test('grouped tool results use the Postman Agent TOOL_RESPONSE contract', () => {
   const state = {
     conversationId: 'conversation-1',
