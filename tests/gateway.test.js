@@ -13,6 +13,7 @@ const {
   codexModelCatalog,
   extractToolResults,
   fitQuery,
+  normalizePostmanToolCall,
   responseObject
 } = require('../postman-gateway-macos');
 
@@ -128,6 +129,28 @@ test('grouped tool results use the Postman Agent TOOL_RESPONSE contract', () => 
   assert.equal(body.input.toolResponses[0].toolResponseRejectionType, 'EXPLICIT');
 });
 
+test('Claude Code subagent model aliases select the matching Postman family', () => {
+  const body = buildPostmanBody({
+    payload: { model: 'claude-sonnet-5' },
+    protocol: 'anthropic',
+    config: {
+      models: [
+        { key: 'GPT_56_TERRA', displayName: 'GPT-5.6 Terra' },
+        { key: 'CLAUDE_46_SONNET_BEDROCK', displayName: 'Claude Sonnet 4.6' }
+      ],
+      defaultModel: 'GPT_56_TERRA'
+    },
+    workspaceId: 'workspace-1',
+    state: {
+      conversationId: null,
+      product: 'workspace_v12',
+      postmanTools: []
+    },
+    toolResults: []
+  });
+  assert.equal(body.devModeOptions.selectedModel, 'CLAUDE_46_SONNET_BEDROCK');
+});
+
 test('Trae tool call IDs are mapped back to the original Postman IDs', (t) => {
   const store = testSessionStore(t);
   const request = {
@@ -210,6 +233,146 @@ test('rewritten tool IDs are not matched when the tool arguments differ', (t) =>
   const resolved = store.resolve(continuation, 'openai', req);
   assert.equal(resolved.reused, false);
   assert.notEqual(resolved.state.id, first.state.id);
+});
+
+test('Postman namespace wrappers are unwrapped to the original client tool', () => {
+  const state = {
+    encodedToOriginal: new Map([['client__Skill', 'Skill']]),
+    originalToEncoded: new Map([['Skill', 'client__Skill']])
+  };
+  const normalized = normalizePostmanToolCall(state, {
+    id: 'call-wrapper',
+    encodedName: 'executeNamespaceTool',
+    arguments: JSON.stringify({
+      namespace: 'external-client',
+      toolName: 'client__Skill',
+      input: { skill: 'ppt-master', args: 'make slides' }
+    })
+  });
+  assert.equal(normalized.name, 'Skill');
+  assert.deepEqual(JSON.parse(normalized.arguments), { skill: 'ppt-master', args: 'make slides' });
+});
+
+test('Postman native file and shell aliases are translated for Claude Code', () => {
+  const state = {
+    encodedToOriginal: new Map(),
+    originalToEncoded: new Map([
+      ['Bash', 'client__Bash'],
+      ['Read', 'client__Read'],
+      ['Write', 'client__Write']
+    ])
+  };
+  const bash = normalizePostmanToolCall(state, {
+    encodedName: 'executeBashCommand',
+    arguments: '{"command":"pwd","isBackground":false}'
+  });
+  assert.equal(bash.name, 'Bash');
+  assert.deepEqual(JSON.parse(bash.arguments), {
+    command: 'pwd',
+    description: '执行命令',
+    run_in_background: false
+  });
+
+  const read = normalizePostmanToolCall(state, {
+    encodedName: 'readFile',
+    arguments: '{"filePath":"/tmp/a.txt","offset":1,"limit":20,"pages":""}'
+  });
+  assert.equal(read.name, 'Read');
+  assert.deepEqual(JSON.parse(read.arguments), { file_path: '/tmp/a.txt', offset: 1, limit: 20 });
+
+  const write = normalizePostmanToolCall(state, {
+    encodedName: 'createFile',
+    arguments: '{"filePath":"/tmp/a.txt","contents":"hello"}'
+  });
+  assert.equal(write.name, 'Write');
+  assert.deepEqual(JSON.parse(write.arguments), { file_path: '/tmp/a.txt', content: 'hello' });
+});
+
+test('blank pages are removed from direct Claude Code Read calls', () => {
+  const state = {
+    encodedToOriginal: new Map([['client__Read', 'Read']]),
+    originalToEncoded: new Map([['Read', 'client__Read']])
+  };
+  const normalized = normalizePostmanToolCall(state, {
+    encodedName: 'client__Read',
+    arguments: '{"file_path":"/tmp/a.txt","offset":0,"limit":100,"pages":""}'
+  });
+  assert.equal(normalized.name, 'Read');
+  assert.deepEqual(JSON.parse(normalized.arguments), { file_path: '/tmp/a.txt', offset: 0, limit: 100 });
+});
+
+test('Postman namespace tool listing is converted to a safe client Bash call', () => {
+  const state = {
+    encodedToOriginal: new Map(),
+    originalToEncoded: new Map([
+      ['Bash', 'client__Bash'],
+      ['Read', 'client__Read']
+    ])
+  };
+  const normalized = normalizePostmanToolCall(state, {
+    encodedName: 'listNamespaceTools',
+    arguments: '{"namespace":"external-client"}'
+  });
+  assert.equal(normalized.name, 'Bash');
+  assert.match(JSON.parse(normalized.arguments).command, /Bash/);
+  assert.match(JSON.parse(normalized.arguments).command, /Read/);
+});
+
+test('Postman listDirectory is converted to a bounded client Bash call', () => {
+  const state = {
+    encodedToOriginal: new Map(),
+    originalToEncoded: new Map([['Bash', 'client__Bash']])
+  };
+  const normalized = normalizePostmanToolCall(state, {
+    encodedName: 'listDirectory',
+    arguments: JSON.stringify({
+      directoryPath: "/tmp/a directory's files",
+      depth: 2,
+      ignoreGlobs: ['node_modules/*']
+    })
+  });
+  const input = JSON.parse(normalized.arguments);
+  assert.equal(normalized.name, 'Bash');
+  assert.match(input.command, /-maxdepth 2/);
+  assert.match(input.command, /node_modules/);
+  assert.equal(input.description, '读取目录内容');
+});
+
+test('Postman namespace listing is converted to a safe client Bash call', () => {
+  const state = {
+    encodedToOriginal: new Map(),
+    originalToEncoded: new Map([['Bash', 'client__Bash']])
+  };
+  const normalized = normalizePostmanToolCall(state, {
+    encodedName: 'listNamespaces',
+    arguments: '{}'
+  });
+  assert.equal(normalized.name, 'Bash');
+  assert.match(JSON.parse(normalized.arguments).command, /external-client/);
+});
+
+test('Claude Agent calls drop optional worktree isolation outside repositories', () => {
+  const state = {
+    encodedToOriginal: new Map([['client__Agent', 'Agent']]),
+    originalToEncoded: new Map([['Agent', 'client__Agent']])
+  };
+  const normalized = normalizePostmanToolCall(state, {
+    encodedName: 'client__Agent',
+    arguments: JSON.stringify({
+      description: 'Make slides',
+      prompt: 'Generate the deck',
+      subagent_type: 'general-purpose',
+      isolation: 'worktree',
+      run_in_background: true
+    })
+  });
+  assert.equal(normalized.name, 'Agent');
+  assert.deepEqual(JSON.parse(normalized.arguments), {
+    description: 'Make slides',
+    prompt: 'Generate the deck',
+    subagent_type: 'general-purpose',
+    run_in_background: true
+  });
 });
 
 test('Responses output exposes Postman calls as function_call items', () => {

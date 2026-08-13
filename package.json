@@ -1,6 +1,6 @@
 {
   "name": "postman-postbot-gateway",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Unofficial Postman Agent gateway for Claude Code, Codex CLI, Trae, and tool-calling clients.",
   "license": "MIT",
   "type": "commonjs",

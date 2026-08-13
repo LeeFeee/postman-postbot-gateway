@@ -188,6 +188,14 @@ function resolveModel(requested, config) {
     return display.includes(normalized) || normalized.includes(display);
   });
   if (fuzzy) return fuzzy.key;
+  const family = ['sonnet', 'opus', 'haiku'].find((name) => normalized.includes(name));
+  if (family) {
+    const compatible = models.find((model) => {
+      const candidate = normalizeModel(`${model.key} ${model.displayName}`);
+      return candidate.includes(family);
+    });
+    if (compatible) return compatible.key;
+  }
   throw new GatewayError(`Postman 账号不支持模型 ${requested}。可用模型: ${models.map((m) => m.key).join(', ')}`, 400);
 }
 
@@ -911,6 +919,117 @@ function mergePostmanToolCall(result, raw, eventType, index) {
   else tool.arguments += typeof argumentChunk === 'string' ? argumentChunk : safeJson(argumentChunk);
 }
 
+function parsedToolArguments(value) {
+  try {
+    const parsed = JSON.parse(value || '{}');
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function compactObject(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined && item !== null));
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'"'"'`)}'`;
+}
+
+function normalizePostmanToolCall(state, tool) {
+  let encodedName = tool.encodedName;
+  let argumentsText = tool.arguments || '{}';
+  let input = parsedToolArguments(argumentsText);
+
+  // Postman sometimes wraps a third-party call in its own namespace router.
+  // The external client only knows the original tool, so unwrap it before the
+  // call is returned to Claude Code, Codex, or Trae.
+  if (encodedName === 'executeNamespaceTool' && input?.namespace === 'external-client' && input.toolName) {
+    encodedName = input.toolName;
+    argumentsText = typeof input.input === 'string' ? input.input : safeJson(input.input || {});
+    input = parsedToolArguments(argumentsText);
+  }
+
+  let name = state.encodedToOriginal.get(encodedName)
+    || encodedName.replace(/^client__/, '')
+    || encodedName;
+
+  const available = (candidate) => state.originalToEncoded.has(candidate);
+  if (encodedName === 'executeBashCommand' && available('Bash') && input?.command) {
+    name = 'Bash';
+    input = compactObject({
+      command: input.command,
+      description: input.description || '执行命令',
+      timeout: input.timeout,
+      run_in_background: input.isBackground === true || input.run_in_background === true
+    });
+    argumentsText = safeJson(input);
+  } else if (encodedName === 'readFile' && available('Read') && input) {
+    name = 'Read';
+    input = compactObject({
+      file_path: input.file_path || input.filePath || input.path,
+      offset: input.offset,
+      limit: input.limit,
+      pages: input.pages
+    });
+    argumentsText = safeJson(input);
+  } else if (encodedName === 'createFile' && available('Write') && input) {
+    name = 'Write';
+    input = compactObject({
+      file_path: input.file_path || input.filePath || input.path,
+      content: input.content ?? input.contents
+    });
+    argumentsText = safeJson(input);
+  } else if (encodedName === 'listDirectory' && available('Bash') && input?.directoryPath) {
+    name = 'Bash';
+    const depth = Math.min(20, Math.max(1, Number.parseInt(input.depth || '1', 10) || 1));
+    const exclusions = Array.isArray(input.ignoreGlobs)
+      ? input.ignoreGlobs.filter((item) => typeof item === 'string' && item).map((item) =>
+        `! -path ${shellQuote(`${input.directoryPath}/${item}`)}`)
+      : [];
+    argumentsText = safeJson({
+      command: `find ${shellQuote(input.directoryPath)} -mindepth 1 -maxdepth ${depth} ${exclusions.join(' ')} -print | sort`,
+      description: '读取目录内容'
+    });
+  } else if (encodedName === 'listNamespaces' && available('Bash')) {
+    name = 'Bash';
+    argumentsText = safeJson({
+      command: "printf '%s\\n' 'external-client'",
+      description: '列出可用工具命名空间'
+    });
+  } else if (encodedName === 'listNamespaceTools' && available('Bash')) {
+    name = 'Bash';
+    const names = [...state.originalToEncoded.keys()].sort();
+    argumentsText = safeJson({
+      command: `printf '%s\\n' ${names.map(shellQuote).join(' ')}`,
+      description: '列出客户端可用工具'
+    });
+  }
+
+  // Claude Code rejects an empty pages value even though some upstream models
+  // include it for ordinary text files. Remove only the invalid empty value.
+  if (name === 'Read') {
+    input = parsedToolArguments(argumentsText);
+    if (input && !input.pages) {
+      delete input.pages;
+      argumentsText = safeJson(input);
+    }
+  }
+
+  // A worktree-isolated Claude subagent cannot start when the current folder
+  // is not a Git repository. Isolation is optional, so let Claude Code run the
+  // same Agent call in the current workspace instead of failing immediately.
+  if (name === 'Agent') {
+    input = parsedToolArguments(argumentsText);
+    if (input?.isolation === 'worktree') {
+      delete input.isolation;
+      argumentsText = safeJson(input);
+    }
+  }
+
+  return { ...tool, encodedName, name, arguments: argumentsText };
+}
+
 async function callPostman({ payload, protocol, state, toolResults }, handlers = {}, signal) {
   const workspaceId = discoverWorkspaceId();
   if (!workspaceId) {
@@ -974,13 +1093,9 @@ async function callPostman({ payload, protocol, state, toolResults }, handlers =
       throw new GatewayError(message, status, event.data?.errorType || 'postman_failure');
     }
   });
-  result.toolCalls = [...result.toolCallMap.values()].sort((a, b) => a.index - b.index).map((tool) => ({
-    ...tool,
-    name: state.encodedToOriginal.get(tool.encodedName)
-      || tool.encodedName.replace(/^client__/, '')
-      || tool.encodedName,
-    arguments: tool.arguments || '{}'
-  }));
+  result.toolCalls = [...result.toolCallMap.values()]
+    .sort((a, b) => a.index - b.index)
+    .map((tool) => normalizePostmanToolCall(state, tool));
   delete result.toolCallMap;
   if (result.approval && !result.toolCalls.length && !result.text) {
     result.text = 'Postman 请求继续执行前需要批准，但上游未返回可供客户端执行的工具调用。请重新发送请求。';
@@ -1531,6 +1646,7 @@ module.exports = {
   createServer,
   extractToolResults,
   fitQuery,
+  normalizePostmanToolCall,
   normalizeToolDefinitions,
   printHelp,
   responseObject,
