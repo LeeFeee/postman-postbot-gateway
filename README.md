@@ -35,8 +35,9 @@ Postman Postbot Gateway 是一个零第三方依赖的 Node.js 本地网关。�
 - Claude Code 2.1.226：首次完整系统提示、文本对话、Bash 工具调用与结果回传
 - Codex CLI 0.147.0：Responses API、shell 工具调用与结果回传
 - OpenAI Chat Completions：文本、工具调用、工具成功/失败/拒绝回传
+- Trae SOLO Agent：真实 `Skill`、`Read` 工具连续调用与最终文本回复
 
-Trae 使用的就是 OpenAI Chat Completions 通路。项目已完成该协议的端到端工具闭环；不同 Trae 版本的模型配置界面可能略有差异。
+Trae SOLO Agent 会在云端协调工具执行，并可能重写模型返回的 `tool_call_id`。网关会使用会话指纹、工具名和规范化参数进行严格匹配，再映射回 Postman 的原始工具调用 ID，保证工具结果能够继续同一个 Postman 会话。不同 Trae 版本的模型配置界面可能略有差异。
 
 ### 工作原理
 
@@ -214,6 +215,7 @@ Postman `/chat` 的 `input.query` 存在约 10,000 字符的硬上限，这和�
 3. 后续请求只发送新增用户消息；Postman 通过服务端会话保留历史。
 4. 工具结果通过 `TOOL_RESPONSE` 单独回传，不再塞回普通文本历史。
 5. Claude Code、Codex 和 Trae 重放完整历史时，网关只处理当前轮尾部的新工具结果。
+6. Trae 重写工具调用 ID 时，网关只在工具名、参数和会话指纹全部匹配后映射回 Postman 原始 ID。
 
 如果单条用户消息本身超过安全上限，网关会保留尾部并明确标记截断。图片和文件二进制目前不会转发，只会生成文字占位符。
 
@@ -281,8 +283,9 @@ Postman Postbot Gateway is a zero-third-party-dependency Node.js gateway. It rea
 - Claude Code 2.1.226: full first-turn prompt, text, Bash call, and tool-result continuation
 - Codex CLI 0.147.0: Responses API, local shell call, and tool-result continuation
 - OpenAI Chat Completions: text, tool calls, successful, failed, and rejected tool results
+- Trae SOLO Agent: live `Skill` and `Read` tool calls followed by the final text response
 
-Trae uses the same OpenAI Chat Completions path. The protocol has been verified end to end, although labels in Trae's model settings may vary by release.
+Trae SOLO Agent coordinates tool execution through its cloud service and may rewrite the model's `tool_call_id`. The gateway strictly matches the session fingerprint, tool name, and normalized arguments before mapping the result back to Postman's original tool call ID. Labels in Trae's model settings may vary by release.
 
 ### Install and start
 
@@ -397,7 +400,7 @@ Trae appends `/chat/completions` automatically when Full URL is off.
 
 Postman's `/chat` endpoint limits `input.query` to approximately 10,000 characters. That is a request-field limit, not the model context window. The previous gateway replayed system instructions and the entire history into that field, so even a first “hello” from an agent client could fail.
 
-The current gateway sends the first system instructions plus the current user turn within a safe limit, stores the returned `conversationId`, sends only new user turns afterward, and returns tool outputs through Postman's dedicated `TOOL_RESPONSE` contract. When a client replays its full history, only trailing tool outputs from the current turn are processed; completed historical outputs are ignored.
+The current gateway sends the first system instructions plus the current user turn within a safe limit, stores the returned `conversationId`, sends only new user turns afterward, and returns tool outputs through Postman's dedicated `TOOL_RESPONSE` contract. When a client replays its full history, only trailing tool outputs from the current turn are processed; completed historical outputs are ignored. If Trae rewrites a tool call ID, the gateway maps it back only when the session fingerprint, tool name, and normalized arguments all match.
 
 Tools are never executed by the gateway. Claude Code, Codex, or Trae receives the call, applies its own approval policy, executes locally, and returns the result. The gateway then continues the same Postman conversation.
 

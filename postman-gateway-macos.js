@@ -294,6 +294,66 @@ function fitQuery(system, user, isNewConversation) {
   return query;
 }
 
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function normalizeToolArguments(value) {
+  const raw = typeof value === 'string' ? value : safeJson(value ?? {});
+  try {
+    return stableJson(JSON.parse(raw));
+  } catch {
+    return raw.trim();
+  }
+}
+
+function latestAssistantToolCalls(payload, protocol) {
+  if (protocol === 'responses' && Array.isArray(payload.input)) {
+    const calls = [];
+    for (let index = payload.input.length - 1; index >= 0; index -= 1) {
+      const item = payload.input[index];
+      if (item?.type === 'function_call_output') continue;
+      if (item?.type === 'function_call') {
+        calls.unshift({ id: item.call_id || item.id, name: item.name, arguments: item.arguments || '' });
+        continue;
+      }
+      if (calls.length) break;
+    }
+    return calls;
+  }
+
+  const messages = protocolMessages(payload, protocol);
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== 'assistant') continue;
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length) {
+      return message.tool_calls.map((tool) => ({
+        id: tool.id,
+        name: tool.function?.name,
+        arguments: tool.function?.arguments || ''
+      }));
+    }
+    if (Array.isArray(message.content)) {
+      const calls = message.content.filter((block) => block?.type === 'tool_use').map((tool) => ({
+        id: tool.id,
+        name: tool.name,
+        arguments: safeJson(tool.input || {})
+      }));
+      if (calls.length) return calls;
+    }
+    return [];
+  }
+  return [];
+}
+
+function canonicalToolCallsWithoutIds(calls) {
+  return calls.map((tool) => `tool:${tool.name || ''}:${normalizeToolArguments(tool.arguments)}`).join('|');
+}
+
 function canonicalAssistantFromPayload(payload, protocol) {
   if (protocol === 'responses' && Array.isArray(payload.input)) {
     for (let i = payload.input.length - 1; i >= 0; i -= 1) {
@@ -337,6 +397,32 @@ function externalSessionKeys(payload, req) {
     typeof payload.conversation === 'string' ? payload.conversation : payload.conversation?.id
   ].filter((value) => typeof value === 'string' && value.length > 0);
   return values.map((value) => `external:${sha(value)}`);
+}
+
+function debugRequestShape(payload, protocol, req) {
+  if (!DEBUG) return;
+  const messages = protocolMessages(payload, protocol);
+  const assistantCalls = [];
+  for (const message of messages) {
+    if (message?.role !== 'assistant') continue;
+    for (const tool of message.tool_calls || []) {
+      assistantCalls.push({ id: tool?.id || null, name: tool?.function?.name || null });
+    }
+    if (Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (block?.type === 'tool_use') assistantCalls.push({ id: block.id || null, name: block.name || null });
+      }
+    }
+  }
+  console.log('[Postman Gateway Debug] request-shape', JSON.stringify({
+    protocol,
+    roles: messages.map((message) => message?.role || null),
+    assistantCalls,
+    toolResults: extractToolResults(payload, protocol).map((result) => result.callId),
+    previousResponseId: payload.previous_response_id || null,
+    externalKeyCount: externalSessionKeys(payload, req).length,
+    anchor: contextAnchor(payload, protocol).slice(0, 12)
+  }));
 }
 
 function extractToolResults(payload, protocol) {
@@ -554,28 +640,86 @@ class SessionStore {
     return state;
   }
 
+  remapToolResults(state, toolResults, payload, protocol) {
+    if (!toolResults.length) return toolResults;
+    const clientCalls = latestAssistantToolCalls(payload, protocol);
+    const claimed = new Set();
+    const remapped = [];
+    for (const result of toolResults) {
+      if (state.pendingTools.has(result.callId)) {
+        claimed.add(result.callId);
+        remapped.push(result);
+        continue;
+      }
+      const clientCall = clientCalls.find((call) => call.id === result.callId);
+      if (!clientCall) return null;
+      const normalizedArguments = normalizeToolArguments(clientCall.arguments);
+      const candidates = [...state.pendingTools.values()].filter((pending) =>
+        !claimed.has(pending.id)
+        && pending.name === clientCall.name
+        && pending.arguments != null
+        && normalizeToolArguments(pending.arguments) === normalizedArguments
+      );
+      if (!candidates.length) return null;
+      const pending = candidates[0];
+      claimed.add(pending.id);
+      remapped.push({ ...result, clientCallId: result.callId, callId: pending.id });
+    }
+    return remapped;
+  }
+
+  resolved(state, toolResults, payload, protocol) {
+    const remapped = this.remapToolResults(state, toolResults, payload, protocol);
+    if (remapped === null) return null;
+    return { state, reused: true, toolResults: remapped };
+  }
+
   resolve(payload, protocol, req) {
     this.cleanup();
+    debugRequestShape(payload, protocol, req);
     const toolResults = extractToolResults(payload, protocol);
     for (const result of toolResults) {
       const state = this.states.get(this.toolCalls.get(result.callId));
-      if (state) return { state, reused: true, toolResults };
+      if (state) {
+        const resolved = this.resolved(state, toolResults, payload, protocol);
+        if (resolved) return resolved;
+      }
     }
     if (payload.previous_response_id) {
       const state = this.states.get(this.responses.get(payload.previous_response_id));
-      if (state) return { state, reused: true, toolResults };
+      if (state) {
+        const resolved = this.resolved(state, toolResults, payload, protocol);
+        if (resolved) return resolved;
+      }
     }
     const anchor = contextAnchor(payload, protocol);
     const previous = canonicalAssistantFromPayload(payload, protocol);
     if (previous) {
       const lineageAlias = `lineage:${sha(`${anchor}:${previous}`)}`;
       const state = this.states.get(this.aliases.get(lineageAlias));
-      if (state) return { state, reused: true, toolResults };
+      if (state) {
+        const resolved = this.resolved(state, toolResults, payload, protocol);
+        if (resolved) return resolved;
+      }
+    }
+    if (toolResults.length) {
+      const clientCalls = latestAssistantToolCalls(payload, protocol);
+      if (clientCalls.length) {
+        const lineageAlias = `tool-lineage:${sha(`${anchor}:${canonicalToolCallsWithoutIds(clientCalls)}`)}`;
+        const state = this.states.get(this.aliases.get(lineageAlias));
+        if (state) {
+          const resolved = this.resolved(state, toolResults, payload, protocol);
+          if (resolved) return resolved;
+        }
+      }
     }
     if (hasConversationLineage(payload, protocol)) {
       for (const key of externalSessionKeys(payload, req)) {
         const state = this.states.get(this.aliases.get(key));
-        if (state) return { state, reused: true, toolResults };
+        if (state) {
+          const resolved = this.resolved(state, toolResults, payload, protocol);
+          if (resolved) return resolved;
+        }
       }
     }
     const state = this.create(anchor);
@@ -604,7 +748,8 @@ class SessionStore {
         id: tool.id,
         groupId: tool.groupId || null,
         name: tool.name,
-        encodedName: tool.encodedName
+        encodedName: tool.encodedName,
+        arguments: tool.arguments || '{}'
       });
       this.toolCalls.set(tool.id, state.id);
     }
@@ -613,6 +758,10 @@ class SessionStore {
       ? result.toolCalls.map((tool) => `tool:${tool.id}:${tool.name}:${tool.arguments}`).join('|')
       : `text:${result.text}`;
     this.aliases.set(`lineage:${sha(`${contextAnchor(payload, protocol)}:${canonical}`)}`, state.id);
+    if (result.toolCalls.length) {
+      const toolLineage = canonicalToolCallsWithoutIds(result.toolCalls);
+      this.aliases.set(`tool-lineage:${sha(`${contextAnchor(payload, protocol)}:${toolLineage}`)}`, state.id);
+    }
     this.persist();
   }
 

@@ -1,9 +1,13 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const test = require('node:test');
 
 const {
+  SessionStore,
   buildPostmanBody,
   buildToolSet,
   codexModelCatalog,
@@ -11,6 +15,12 @@ const {
   fitQuery,
   responseObject
 } = require('../postman-gateway-macos');
+
+function testSessionStore(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'postman-gateway-test-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  return new SessionStore(path.join(directory, 'sessions.json'));
+}
 
 test('fitQuery keeps Postman query below the verified hard limit', () => {
   const query = fitQuery('S'.repeat(9000), `important-start\n${'U'.repeat(12000)}\nimportant-end`, true);
@@ -116,6 +126,90 @@ test('grouped tool results use the Postman Agent TOOL_RESPONSE contract', () => 
   assert.equal(body.input.toolCallGroupId, 'group-1');
   assert.equal(body.input.toolResponses[0].toolResponseStatus, 'REJECTED');
   assert.equal(body.input.toolResponses[0].toolResponseRejectionType, 'EXPLICIT');
+});
+
+test('Trae tool call IDs are mapped back to the original Postman IDs', (t) => {
+  const store = testSessionStore(t);
+  const request = {
+    model: 'gpt-5.5',
+    messages: [
+      { role: 'system', content: 'You are a coding agent.' },
+      { role: 'user', content: 'Inspect this folder.' }
+    ]
+  };
+  const req = { headers: {} };
+  const first = store.resolve(request, 'openai', req);
+  store.updateConversation(first.state, 'conversation-trae');
+  store.registerResult(first.state, request, 'openai', {
+    text: '',
+    toolCalls: [{
+      id: 'call_postman_original',
+      groupId: 'group-trae',
+      name: 'LS',
+      encodedName: 'client__LS',
+      arguments: '{"path":"/tmp/example"}'
+    }]
+  });
+
+  const continuation = {
+    ...request,
+    messages: [
+      ...request.messages,
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_trae_rewritten',
+          type: 'function',
+          function: { name: 'LS', arguments: '{ "path": "/tmp/example" }' }
+        }]
+      },
+      { role: 'tool', tool_call_id: 'call_trae_rewritten', content: 'file.txt' }
+    ]
+  };
+  const resolved = store.resolve(continuation, 'openai', req);
+  assert.equal(resolved.reused, true);
+  assert.equal(resolved.state.id, first.state.id);
+  assert.deepEqual(resolved.toolResults, [{
+    callId: 'call_postman_original',
+    clientCallId: 'call_trae_rewritten',
+    content: 'file.txt',
+    isError: false
+  }]);
+
+  const body = buildPostmanBody({
+    payload: continuation,
+    protocol: 'openai',
+    config: { models: [{ key: 'GPT_55', displayName: 'GPT-5.5' }], defaultModel: 'GPT_54' },
+    workspaceId: 'workspace-1',
+    state: resolved.state,
+    toolResults: resolved.toolResults
+  });
+  assert.equal(body.input.conversationId, 'conversation-trae');
+  assert.equal(body.input.toolResponses[0].toolCallId, 'call_postman_original');
+});
+
+test('rewritten tool IDs are not matched when the tool arguments differ', (t) => {
+  const store = testSessionStore(t);
+  const request = { messages: [{ role: 'user', content: 'Inspect folder A.' }] };
+  const req = { headers: {} };
+  const first = store.resolve(request, 'openai', req);
+  store.updateConversation(first.state, 'conversation-a');
+  store.registerResult(first.state, request, 'openai', {
+    text: '',
+    toolCalls: [{ id: 'call_a', groupId: 'group-a', name: 'LS', arguments: '{"path":"/a"}' }]
+  });
+
+  const continuation = {
+    messages: [
+      ...request.messages,
+      { role: 'assistant', tool_calls: [{ id: 'call_rewritten', type: 'function', function: { name: 'LS', arguments: '{"path":"/b"}' } }] },
+      { role: 'tool', tool_call_id: 'call_rewritten', content: 'unexpected' }
+    ]
+  };
+  const resolved = store.resolve(continuation, 'openai', req);
+  assert.equal(resolved.reused, false);
+  assert.notEqual(resolved.state.id, first.state.id);
 });
 
 test('Responses output exposes Postman calls as function_call items', () => {
