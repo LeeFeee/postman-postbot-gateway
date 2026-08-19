@@ -288,6 +288,90 @@ test('Postman native file and shell aliases are translated for Claude Code', () 
   assert.deepEqual(JSON.parse(write.arguments), { file_path: '/tmp/a.txt', content: 'hello' });
 });
 
+test('Postman searchInFiles is converted to a Claude Code Grep call', () => {
+  const state = {
+    encodedToOriginal: new Map(),
+    originalToEncoded: new Map([
+      ['Grep', 'client__Grep'],
+      ['Bash', 'client__Bash']
+    ])
+  };
+  const normalized = normalizePostmanToolCall(state, {
+    id: 'call-search',
+    encodedName: 'searchInFiles',
+    arguments: JSON.stringify({
+      query: 'OpenAI-compatible (v2)+',
+      isRegex: false,
+      fileNamePatterns: [
+        '/Users/leefee/deepseek-harness/docs/**/*.md',
+        '/Users/leefee/deepseek-harness/apps/**/*.md',
+        '/Users/leefee/deepseek-harness/python/**/*.md'
+      ]
+    })
+  });
+  assert.equal(normalized.id, 'call-search');
+  assert.equal(normalized.name, 'Grep');
+  assert.deepEqual(JSON.parse(normalized.arguments), {
+    pattern: 'OpenAI-compatible \\(v2\\)\\+',
+    path: '/Users/leefee/deepseek-harness',
+    glob: '{docs/**/*.md,apps/**/*.md,python/**/*.md}',
+    output_mode: 'content',
+    '-n': true,
+    head_limit: 200
+  });
+});
+
+test('Postman searchInFiles preserves regex and search options', () => {
+  const state = {
+    encodedToOriginal: new Map(),
+    originalToEncoded: new Map([['Grep', 'client__Grep']])
+  };
+  const normalized = normalizePostmanToolCall(state, {
+    encodedName: 'searchInFiles',
+    arguments: JSON.stringify({
+      query: 'OpenAI\\s+compatible',
+      isRegex: true,
+      isCaseSensitive: false,
+      maxResults: 50,
+      fileNamePatterns: ['/tmp/docs/**/*.md']
+    })
+  });
+  assert.equal(normalized.name, 'Grep');
+  assert.deepEqual(JSON.parse(normalized.arguments), {
+    pattern: 'OpenAI\\s+compatible',
+    path: '/tmp/docs',
+    glob: '**/*.md',
+    output_mode: 'content',
+    '-n': true,
+    '-i': true,
+    head_limit: 50
+  });
+});
+
+test('Postman searchInFiles falls back to a safely quoted rg command', () => {
+  const state = {
+    encodedToOriginal: new Map(),
+    originalToEncoded: new Map([['Bash', 'client__Bash']])
+  };
+  const normalized = normalizePostmanToolCall(state, {
+    encodedName: 'searchInFiles',
+    arguments: JSON.stringify({
+      query: "writer's + draft",
+      isRegex: false,
+      limit: 25,
+      fileNamePatterns: ['/tmp/a project/docs/**/*.md']
+    })
+  });
+  const input = JSON.parse(normalized.arguments);
+  assert.equal(normalized.name, 'Bash');
+  assert.equal(input.description, '搜索文件内容');
+  assert.match(input.command, /rg --line-number/);
+  assert.match(input.command, /--fixed-strings/);
+  assert.match(input.command, /--glob '\*\*\/\*\.md'/);
+  assert.match(input.command, /writer/);
+  assert.match(input.command, /sed -n '1,25p'/);
+});
+
 test('blank pages are removed from direct Claude Code Read calls', () => {
   const state = {
     encodedToOriginal: new Map([['client__Read', 'Read']]),

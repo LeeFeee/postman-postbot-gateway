@@ -936,6 +936,93 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'"'"'`)}'`;
 }
 
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function firstGlobIndex(value) {
+  const indexes = ['*', '?', '[', '{']
+    .map((character) => value.indexOf(character))
+    .filter((index) => index !== -1);
+  return indexes.length ? Math.min(...indexes) : -1;
+}
+
+function patternBaseDirectory(pattern) {
+  const globIndex = firstGlobIndex(pattern);
+  if (globIndex === -1) return path.dirname(pattern);
+  const prefix = pattern.slice(0, globIndex);
+  if (!prefix) return '.';
+  if (/[\\/]$/.test(prefix)) return prefix.replace(/[\\/]+$/, '') || path.parse(pattern).root;
+  return path.dirname(prefix);
+}
+
+function commonDirectory(directories) {
+  let common = path.resolve(directories[0]);
+  for (const directory of directories.slice(1)) {
+    const resolved = path.resolve(directory);
+    while (resolved !== common && !resolved.startsWith(`${common}${path.sep}`)) {
+      const parent = path.dirname(common);
+      if (parent === common) break;
+      common = parent;
+    }
+  }
+  return common;
+}
+
+function slashPath(value) {
+  return String(value).split(path.sep).join('/');
+}
+
+function searchFilePatterns(input) {
+  const candidates = Array.isArray(input.fileNamePatterns)
+    ? input.fileNamePatterns
+    : typeof input.fileNamePattern === 'string'
+      ? [input.fileNamePattern]
+      : [];
+  return [...new Set(candidates.filter((item) => typeof item === 'string' && item.trim()).map((item) => item.trim()))];
+}
+
+function searchScope(input) {
+  const patterns = searchFilePatterns(input);
+  const explicitPath = input.directoryPath || input.rootPath || input.path;
+  if (typeof explicitPath === 'string' && explicitPath) {
+    const globs = patterns.map((pattern) => path.isAbsolute(pattern)
+      ? slashPath(path.relative(explicitPath, pattern))
+      : slashPath(pattern));
+    return { path: explicitPath, globs };
+  }
+  if (patterns.length && patterns.every((pattern) => path.isAbsolute(pattern))) {
+    const root = commonDirectory(patterns.map(patternBaseDirectory));
+    return {
+      path: root,
+      globs: patterns.map((pattern) => slashPath(path.relative(root, pattern)))
+    };
+  }
+  return { path: undefined, globs: patterns.map(slashPath) };
+}
+
+function combinedGlob(globs) {
+  if (!globs.length) return undefined;
+  return globs.length === 1 ? globs[0] : `{${globs.join(',')}}`;
+}
+
+function searchResultLimit(input) {
+  const parsed = Number.parseInt(input.maxResults ?? input.limit ?? '200', 10);
+  return Math.min(1000, Math.max(1, Number.isFinite(parsed) ? parsed : 200));
+}
+
+function searchInFilesBashInput(input, scope, limit) {
+  const command = ['rg', '--line-number', '--no-heading', '--color', 'never'];
+  if (input.isRegex !== true) command.push('--fixed-strings');
+  if (input.caseSensitive === false || input.isCaseSensitive === false) command.push('--ignore-case');
+  for (const glob of scope.globs) command.push('--glob', shellQuote(glob));
+  command.push('--', shellQuote(input.query), shellQuote(scope.path || '.'));
+  return {
+    command: `${command.join(' ')} | sed -n ${shellQuote(`1,${limit}p`)}`,
+    description: '搜索文件内容'
+  };
+}
+
 function normalizePostmanToolCall(state, tool) {
   let encodedName = tool.encodedName;
   let argumentsText = tool.arguments || '{}';
@@ -980,6 +1067,24 @@ function normalizePostmanToolCall(state, tool) {
       content: input.content ?? input.contents
     });
     argumentsText = safeJson(input);
+  } else if (encodedName === 'searchInFiles' && typeof input?.query === 'string' && input.query) {
+    const scope = searchScope(input);
+    const limit = searchResultLimit(input);
+    if (available('Grep')) {
+      name = 'Grep';
+      argumentsText = safeJson(compactObject({
+        pattern: input.isRegex === true ? input.query : escapeRegex(input.query),
+        path: scope.path,
+        glob: combinedGlob(scope.globs),
+        output_mode: 'content',
+        '-n': true,
+        '-i': input.caseSensitive === false || input.isCaseSensitive === false ? true : undefined,
+        head_limit: limit
+      }));
+    } else if (available('Bash')) {
+      name = 'Bash';
+      argumentsText = safeJson(searchInFilesBashInput(input, scope, limit));
+    }
   } else if (encodedName === 'listDirectory' && available('Bash') && input?.directoryPath) {
     name = 'Bash';
     const depth = Math.min(20, Math.max(1, Number.parseInt(input.depth || '1', 10) || 1));

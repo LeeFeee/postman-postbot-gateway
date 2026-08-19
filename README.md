@@ -39,7 +39,7 @@ Postman Postbot Gateway 是一个零第三方依赖的 Node.js 本地网关。�
 
 Trae SOLO Agent 会在云端协调工具执行，并可能重写模型返回的 `tool_call_id`。网关会使用会话指纹、工具名和规范化参数进行严格匹配，再映射回 Postman 的原始工具调用 ID，保证工具结果能够继续同一个 Postman 会话。不同 Trae 版本的模型配置界面可能略有差异。
 
-Postman Agent 偶尔会用自己的内部工具包装客户端工具，例如 `executeNamespaceTool`、`executeBashCommand`、`readFile`、`createFile`、`listDirectory` 或命名空间查询工具。网关会把这些调用还原为客户端实际提供的 `Skill`、`Bash`、`Read` 和 `Write`，并清理 Claude Code 不接受的空 `pages` 参数。Claude Code 的 Agent 调用如果携带可选的 worktree 隔离，网关也会移除该参数，避免在非 Git 目录中启动失败。
+Postman Agent 偶尔会用自己的内部工具包装客户端工具，例如 `executeNamespaceTool`、`executeBashCommand`、`readFile`、`createFile`、`searchInFiles`、`listDirectory` 或命名空间查询工具。网关会把这些调用还原为客户端实际提供的 `Skill`、`Bash`、`Grep`、`Read` 和 `Write`；`searchInFiles` 在没有 `Grep` 时会安全降级为 `Bash + rg`。网关还会清理 Claude Code 不接受的空 `pages` 参数。Claude Code 的 Agent 调用如果携带可选的 worktree 隔离，网关也会移除该参数，避免在非 Git 目录中启动失败。
 
 ### 工作原理
 
@@ -289,7 +289,7 @@ Postman Postbot Gateway is a zero-third-party-dependency Node.js gateway. It rea
 
 Trae SOLO Agent coordinates tool execution through its cloud service and may rewrite the model's `tool_call_id`. The gateway strictly matches the session fingerprint, tool name, and normalized arguments before mapping the result back to Postman's original tool call ID. Labels in Trae's model settings may vary by release.
 
-Postman Agent may occasionally wrap client tools in internal names such as `executeNamespaceTool`, `executeBashCommand`, `readFile`, `createFile`, `listDirectory`, or namespace-discovery helpers. The gateway translates them back to the client-provided `Skill`, `Bash`, `Read`, and `Write` tools and removes an empty `pages` field that Claude Code rejects. It also removes optional worktree isolation from Claude Code Agent calls so they can run outside a Git repository.
+Postman Agent may occasionally wrap client tools in internal names such as `executeNamespaceTool`, `executeBashCommand`, `readFile`, `createFile`, `searchInFiles`, `listDirectory`, or namespace-discovery helpers. The gateway translates them back to the client-provided `Skill`, `Bash`, `Grep`, `Read`, and `Write` tools; `searchInFiles` safely falls back to `Bash + rg` when `Grep` is unavailable. It also removes an empty `pages` field that Claude Code rejects and drops optional worktree isolation from Claude Code Agent calls so they can run outside a Git repository.
 
 ### Install and start
 
