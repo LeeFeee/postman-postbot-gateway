@@ -13,6 +13,10 @@ const {
   codexModelCatalog,
   extractToolResults,
   fitQuery,
+  getAnthropicStructuredOutput,
+  isClaudeCodeAutoModeClassifier,
+  normalizeAnthropicAutoModeResult,
+  normalizeAnthropicStructuredResult,
   normalizePostmanToolCall,
   responseObject
 } = require('../postman-gateway-macos');
@@ -27,6 +31,143 @@ test('fitQuery keeps Postman query below the verified hard limit', () => {
   const query = fitQuery('S'.repeat(9000), `important-start\n${'U'.repeat(12000)}\nimportant-end`, true);
   assert.ok(query.length <= 9800);
   assert.match(query, /important-end$/);
+});
+
+test('fitQuery preserves the tail contract of oversized system prompts', () => {
+  const system = [
+    'You are a security monitor for autonomous AI coding agents.',
+    'P'.repeat(110000),
+    '## Output Format',
+    'If allowed, return exactly <block>no</block>.'
+  ].join('\n');
+  const query = fitQuery(system, 'Classify this Write action.', true);
+  assert.ok(query.length <= 9800);
+  assert.match(query, /You are a security monitor/);
+  assert.match(query, /系统提示中段已由网关截断/);
+  assert.match(query, /## Output Format/);
+  assert.match(query, /<block>no<\/block>/);
+  assert.match(query, /Classify this Write action\.$/);
+});
+
+test('Claude Code Auto mode requests receive a final XML-only contract', () => {
+  const payload = {
+    model: 'claude-sonnet-5',
+    system: [
+      'You are a security monitor for autonomous AI coding agents.',
+      'P'.repeat(110000),
+      '## Output Format',
+      'If allowed, return <block>no</block>.'
+    ].join('\n'),
+    messages: [{ role: 'user', content: 'Bash echo safe' }]
+  };
+  assert.equal(isClaudeCodeAutoModeClassifier(payload, 'anthropic'), true);
+  const body = buildPostmanBody({
+    payload,
+    protocol: 'anthropic',
+    config: { models: [{ key: 'CLAUDE_46_SONNET_BEDROCK', displayName: 'Claude Sonnet 4.6' }] },
+    workspaceId: 'workspace-1',
+    state: { conversationId: null, product: 'workspace_v12', postmanTools: [] },
+    toolResults: []
+  });
+  assert.match(body.input.query, /Bash echo safe/);
+  assert.match(body.input.query, /CLAUDE_CODE_AUTO_MODE_RESPONSE_CONTRACT/);
+  assert.match(body.input.query, /Return XML only/);
+  assert.match(body.input.query, /<block>no<\/block>/);
+});
+
+test('Auto mode XML is extracted from surrounding Postman prose', () => {
+  const payload = {
+    system: 'You are a security monitor for autonomous AI coding agents.\n## Output Format\n<block>no</block>'
+  };
+  const allowed = normalizeAnthropicAutoModeResult(payload, 'anthropic', {
+    text: 'The action is safe.\n<block>no</block>\nDone.',
+    toolCalls: []
+  });
+  assert.equal(allowed.text, '<block>no</block>');
+
+  const blocked = normalizeAnthropicAutoModeResult(payload, 'anthropic', {
+    text: '<block>yes</block><category>Data Exfiltration</category><reason>[Data Exfiltration] external upload</reason>',
+    toolCalls: []
+  });
+  assert.equal(blocked.text, '<block>yes</block><category>Data Exfiltration</category><reason>[Data Exfiltration] external upload</reason>');
+});
+
+test('Anthropic JSON schema requirements are preserved in the Postman query', () => {
+  const schema = {
+    type: 'object',
+    properties: {
+      ok: { type: 'boolean' },
+      reason: { type: 'string' }
+    },
+    required: ['ok', 'reason'],
+    additionalProperties: false
+  };
+  const payload = {
+    model: 'GPT_56_SOL',
+    system: 'Evaluate the condition.',
+    messages: [{ role: 'user', content: 'Has the goal been completed?' }],
+    output_config: { format: { type: 'json_schema', schema } }
+  };
+  assert.deepEqual(getAnthropicStructuredOutput(payload), { schema });
+
+  const body = buildPostmanBody({
+    payload,
+    protocol: 'anthropic',
+    config: { models: [{ key: 'GPT_56_SOL', displayName: 'GPT-5.6 Sol' }] },
+    workspaceId: 'workspace-1',
+    state: { conversationId: null, product: 'workspace_v12', postmanTools: [] },
+    toolResults: []
+  });
+  assert.match(body.input.query, /STRUCTURED_OUTPUT_REQUIRED/);
+  assert.match(body.input.query, /"required":\["ok","reason"\]/);
+  assert.match(body.input.query, /ONLY the JSON value/);
+});
+
+test('Claude Code goal-hook prose is normalized to its required JSON schema', () => {
+  const payload = {
+    output_config: {
+      format: {
+        type: 'json_schema',
+        schema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            reason: { type: 'string' },
+            impossible: { type: 'boolean' }
+          },
+          required: ['ok', 'reason'],
+          additionalProperties: false
+        }
+      }
+    }
+  };
+  const result = normalizeAnthropicStructuredResult(payload, {
+    text: 'No. The transcript contains planning only; the platform was not built.',
+    toolCalls: []
+  });
+  assert.deepEqual(JSON.parse(result.text), {
+    ok: false,
+    reason: 'The transcript contains planning only; the platform was not built.'
+  });
+});
+
+test('fenced structured JSON is extracted, validated, and compacted', () => {
+  const payload = {
+    output_format: {
+      type: 'json_schema',
+      schema: {
+        type: 'object',
+        properties: { title: { type: 'string' } },
+        required: ['title'],
+        additionalProperties: false
+      }
+    }
+  };
+  const result = normalizeAnthropicStructuredResult(payload, {
+    text: '```json\n{"title":"Document"}\n```',
+    toolCalls: []
+  });
+  assert.equal(result.text, '{"title":"Document"}');
 });
 
 test('tool definitions are translated and long names remain reversible', () => {

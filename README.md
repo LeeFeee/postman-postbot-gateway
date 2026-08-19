@@ -13,6 +13,9 @@ Postman Postbot Gateway 是一个零第三方依赖的 Node.js 本地网关。�
 
 - 真实转发到 `gateway.postman.com/chat`，不返回模拟文本
 - 支持 Anthropic Messages `/v1/messages`，可接入 Claude Code
+- 兼容 Anthropic `output_config.format=json_schema`，支持 Claude Code `/goal` Stop Hook 等结构化判定
+- 对超长系统提示同时保留开头和末尾输出契约，兼容 Claude Code Auto mode 的 XML 安全分类器
+- 在复杂命令末尾强化 Auto mode XML 契约并净化响应，避免 Postman 助手身份覆盖安全判定
 - 支持 OpenAI Responses `/v1/responses`，可接入 Codex CLI
 - 支持 OpenAI Chat Completions `/v1/chat/completions`，可接入 Trae 等客户端
 - 转换 Anthropic `tool_use` / `tool_result`
@@ -32,7 +35,8 @@ Postman Postbot Gateway 是一个零第三方依赖的 Node.js 本地网关。�
 - macOS Apple Silicon
 - Postman 12.23.1
 - Node.js 22
-- Claude Code 2.1.226：首次完整系统提示、文本对话、Bash 工具调用与结果回传
+- Claude Code 2.1.229：首次完整系统提示、文本对话、Bash 工具调用、结果回传与 `/goal` 结构化 Stop Hook
+- Claude Code 2.1.229 Auto mode：安全分类器 XML 判定、计划文件写入审批
 - Codex CLI 0.147.0：Responses API、shell 工具调用与结果回传
 - OpenAI Chat Completions：文本、工具调用、工具成功/失败/拒绝回传
 - Trae SOLO Agent：真实 `Skill`、`Read` 工具连续调用与最终文本回复
@@ -246,7 +250,9 @@ npm run check
 npm test
 ```
 
-自动化测试覆盖输入上限、三种工具定义、三种工具结果、历史结果重放、并行结果、分组 toolResponse、拒绝审批和 Responses function call。
+自动化测试覆盖输入上限、Anthropic JSON Schema 结构化输出、三种工具定义、三种工具结果、历史结果重放、并行结果、分组 toolResponse、拒绝审批和 Responses function call。
+
+每次发布和推送的具体修改见 [CHANGELOG.md](CHANGELOG.md)。
 
 ### License
 
@@ -262,6 +268,9 @@ Postman Postbot Gateway is a zero-third-party-dependency Node.js gateway. It rea
 
 - Real forwarding to `gateway.postman.com/chat`; no mock responses
 - Anthropic Messages `/v1/messages` for Claude Code
+- Anthropic `output_config.format=json_schema` compatibility for Claude Code `/goal` Stop Hooks and other structured checks
+- Head-and-tail preservation for oversized system prompts, including Claude Code Auto mode's XML classifier contract
+- A final Auto mode XML contract and response normalization for complex actions, preventing Postman's assistant persona from replacing the safety verdict
 - OpenAI Responses `/v1/responses` for Codex CLI
 - OpenAI Chat Completions `/v1/chat/completions` for Trae and compatible clients
 - Anthropic `tool_use` / `tool_result` translation
@@ -282,7 +291,8 @@ Postman Postbot Gateway is a zero-third-party-dependency Node.js gateway. It rea
 - macOS on Apple Silicon
 - Postman 12.23.1
 - Node.js 22
-- Claude Code 2.1.226: full first-turn prompt, text, Bash call, and tool-result continuation
+- Claude Code 2.1.229: full first-turn prompt, text, Bash call, tool-result continuation, and `/goal` structured Stop Hook
+- Claude Code 2.1.229 Auto mode: XML safety classification and plan-file write approval
 - Codex CLI 0.147.0: Responses API, local shell call, and tool-result continuation
 - OpenAI Chat Completions: text, tool calls, successful, failed, and rejected tool results
 - Trae SOLO Agent: live `Skill` and `Read` tool calls followed by the final text response
@@ -432,6 +442,8 @@ Tools are never executed by the gateway. Claude Code, Codex, or Trae receives th
 npm run check
 npm test
 ```
+
+See [CHANGELOG.md](CHANGELOG.md) for the exact changes included in each release and push.
 
 ### License
 

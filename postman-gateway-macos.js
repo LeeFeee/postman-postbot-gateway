@@ -219,6 +219,258 @@ function safeJson(value) {
   }
 }
 
+function getAnthropicStructuredOutput(payload) {
+  const format = payload?.output_config?.format || payload?.output_format;
+  if (!format || format.type !== 'json_schema' || !format.schema || typeof format.schema !== 'object') {
+    return null;
+  }
+  return { schema: format.schema };
+}
+
+function structuredOutputInstruction(payload, protocol) {
+  if (protocol !== 'anthropic') return '';
+  const structured = getAnthropicStructuredOutput(payload);
+  if (!structured) return '';
+  const schema = JSON.stringify(structured.schema);
+  if (schema.length > 7000) {
+    throw new GatewayError('结构化输出 JSON Schema 超过 Postman 单次输入可安全转发的大小', 400, 'structured_output_schema_too_large');
+  }
+  return [
+    '[STRUCTURED_OUTPUT_REQUIRED]',
+    'Return ONLY the JSON value required by the following JSON Schema.',
+    'Do not use Markdown fences, prose, labels, or a leading Yes/No sentence.',
+    'The response is machine-validated. Every required property must be present and no undeclared property may be added.',
+    `JSON Schema: ${schema}`,
+    '[/STRUCTURED_OUTPUT_REQUIRED]'
+  ].join('\n');
+}
+
+function isClaudeCodeAutoModeClassifier(payload, protocol) {
+  if (protocol !== 'anthropic') return false;
+  const system = systemText(payload, protocol);
+  return /security monitor for autonomous AI coding agents/i.test(system)
+    && /## Output Format/.test(system)
+    && /<block>no<\/block>/.test(system);
+}
+
+function autoModeClassifierInstruction(payload, protocol) {
+  if (!isClaudeCodeAutoModeClassifier(payload, protocol)) return '';
+  return [
+    '[CLAUDE_CODE_AUTO_MODE_RESPONSE_CONTRACT]',
+    'This is a machine safety-classification request, not a request to execute or explain the final action.',
+    'Apply the supplied security policy to the final action.',
+    'If allowed, reply exactly: <block>no</block>',
+    'If blocked, reply exactly: <block>yes</block><category>Exact Rule Name</category><reason>[Exact Rule Name] one short sentence</reason>',
+    'Return XML only. Do not mention Postman, capabilities, or provide any prose.',
+    '[/CLAUDE_CODE_AUTO_MODE_RESPONSE_CONTRACT]'
+  ].join('\n');
+}
+
+function jsonTypeMatches(value, type) {
+  if (type === 'null') return value === null;
+  if (type === 'array') return Array.isArray(value);
+  if (type === 'object') return value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (type === 'integer') return Number.isInteger(value);
+  if (type === 'number') return typeof value === 'number' && Number.isFinite(value);
+  return typeof value === type;
+}
+
+function validateJsonSchema(value, schema, location = '$') {
+  if (schema === true) return [];
+  if (schema === false) return [`${location} is rejected by the schema`];
+  if (!schema || typeof schema !== 'object') return [];
+
+  if (schema.const !== undefined && stableJson(value) !== stableJson(schema.const)) {
+    return [`${location} does not match const`];
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.some((item) => stableJson(item) === stableJson(value))) {
+    return [`${location} is not in enum`];
+  }
+  if (Array.isArray(schema.allOf)) {
+    const errors = schema.allOf.flatMap((item) => validateJsonSchema(value, item, location));
+    if (errors.length) return errors;
+  }
+  if (Array.isArray(schema.anyOf) && !schema.anyOf.some((item) => validateJsonSchema(value, item, location).length === 0)) {
+    return [`${location} does not match anyOf`];
+  }
+  if (Array.isArray(schema.oneOf)) {
+    const matches = schema.oneOf.filter((item) => validateJsonSchema(value, item, location).length === 0).length;
+    if (matches !== 1) return [`${location} does not match exactly one oneOf branch`];
+  }
+
+  const allowedTypes = Array.isArray(schema.type) ? schema.type : schema.type ? [schema.type] : [];
+  if (allowedTypes.length && !allowedTypes.some((type) => jsonTypeMatches(value, type))) {
+    return [`${location} must be ${allowedTypes.join(' or ')}`];
+  }
+
+  if (typeof value === 'string') {
+    if (Number.isInteger(schema.minLength) && value.length < schema.minLength) return [`${location} is shorter than minLength`];
+    if (Number.isInteger(schema.maxLength) && value.length > schema.maxLength) return [`${location} is longer than maxLength`];
+    if (typeof schema.pattern === 'string') {
+      try {
+        if (!new RegExp(schema.pattern).test(value)) return [`${location} does not match pattern`];
+      } catch {
+        return [`${location} has an unsupported schema pattern`];
+      }
+    }
+  }
+
+  if (typeof value === 'number') {
+    if (typeof schema.minimum === 'number' && value < schema.minimum) return [`${location} is below minimum`];
+    if (typeof schema.maximum === 'number' && value > schema.maximum) return [`${location} is above maximum`];
+  }
+
+  if (Array.isArray(value)) {
+    if (Number.isInteger(schema.minItems) && value.length < schema.minItems) return [`${location} has too few items`];
+    if (Number.isInteger(schema.maxItems) && value.length > schema.maxItems) return [`${location} has too many items`];
+    if (schema.items) {
+      for (const [index, item] of value.entries()) {
+        const errors = validateJsonSchema(item, schema.items, `${location}[${index}]`);
+        if (errors.length) return errors;
+      }
+    }
+  }
+
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    const properties = schema.properties && typeof schema.properties === 'object' ? schema.properties : {};
+    for (const required of schema.required || []) {
+      if (!Object.prototype.hasOwnProperty.call(value, required)) return [`${location}.${required} is required`];
+    }
+    for (const [key, item] of Object.entries(value)) {
+      if (Object.prototype.hasOwnProperty.call(properties, key)) {
+        const errors = validateJsonSchema(item, properties[key], `${location}.${key}`);
+        if (errors.length) return errors;
+      } else if (schema.additionalProperties === false) {
+        return [`${location}.${key} is not allowed`];
+      } else if (schema.additionalProperties && typeof schema.additionalProperties === 'object') {
+        const errors = validateJsonSchema(item, schema.additionalProperties, `${location}.${key}`);
+        if (errors.length) return errors;
+      }
+    }
+  }
+  return [];
+}
+
+function parseJsonCandidate(text) {
+  const trimmed = String(text || '').trim();
+  const candidates = [trimmed];
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) candidates.push(fenced[1].trim());
+
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate);
+    } catch {}
+  }
+
+  for (let start = 0; start < trimmed.length; start += 1) {
+    const opener = trimmed[start];
+    if (opener !== '{' && opener !== '[') continue;
+    const closer = opener === '{' ? '}' : ']';
+    let depth = 0;
+    let quoted = false;
+    let escaped = false;
+    for (let index = start; index < trimmed.length; index += 1) {
+      const char = trimmed[index];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (char === '\\') escaped = true;
+        else if (char === '"') quoted = false;
+        continue;
+      }
+      if (char === '"') quoted = true;
+      else if (char === opener) depth += 1;
+      else if (char === closer) {
+        depth -= 1;
+        if (depth === 0) {
+          try {
+            return JSON.parse(trimmed.slice(start, index + 1));
+          } catch {
+            break;
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function coerceGoalHookVerdict(text, schema) {
+  const properties = schema?.properties || {};
+  const required = new Set(schema?.required || []);
+  const isGoalHookSchema = properties.ok?.type === 'boolean'
+    && properties.reason?.type === 'string'
+    && required.has('ok')
+    && required.has('reason');
+  if (!isGoalHookSchema) return null;
+
+  const trimmed = String(text || '').trim();
+  const negative = trimmed.match(/^(?:no|false)\b[\s:.,;!\-–—]*/i)
+    || trimmed.match(/^(?:not\s+(?:met|satisfied|complete(?:d)?))\b[\s:.,;!\-–—]*/i)
+    || trimmed.match(/^(?:否|未完成|没有完成|不满足)[\s：:，,。.]*/);
+  const positive = trimmed.match(/^(?:yes|true)\b[\s:.,;!\-–—]*/i)
+    || trimmed.match(/^(?:(?:condition\s+)?(?:met|satisfied|complete(?:d)?))\b[\s:.,;!\-–—]*/i)
+    || trimmed.match(/^(?:是|已完成|满足)[\s：:，,。.]*/);
+  if (!negative && !positive) return null;
+  const prefix = negative || positive;
+  const reason = trimmed.slice(prefix[0].length).trim()
+    || (negative ? 'The condition is not met.' : 'The condition is met.');
+  return { ok: Boolean(positive), reason };
+}
+
+function normalizeAnthropicStructuredResult(payload, result) {
+  const structured = getAnthropicStructuredOutput(payload);
+  if (!structured || (result.toolCalls && result.toolCalls.length)) return result;
+
+  let value = parseJsonCandidate(result.text);
+  let errors = value === null ? ['response is not JSON'] : validateJsonSchema(value, structured.schema);
+  if (errors.length) {
+    const coerced = coerceGoalHookVerdict(result.text, structured.schema);
+    if (coerced) {
+      value = coerced;
+      errors = validateJsonSchema(value, structured.schema);
+    }
+  }
+  if (errors.length) {
+    throw new GatewayError(
+      `Postman 模型未返回符合 JSON Schema 的结构化输出: ${errors[0]}`,
+      502,
+      'invalid_structured_output'
+    );
+  }
+  return { ...result, text: JSON.stringify(value) };
+}
+
+function normalizeAnthropicAutoModeResult(payload, protocol, result) {
+  if (!isClaudeCodeAutoModeClassifier(payload, protocol) || (result.toolCalls && result.toolCalls.length)) {
+    return result;
+  }
+  const text = String(result.text || '');
+  const decision = text.match(/<block>\s*(yes|no)\s*<\/block>/i);
+  if (!decision) {
+    throw new GatewayError(
+      'Postman 模型未返回 Claude Code Auto mode 要求的 XML 判定',
+      502,
+      'invalid_auto_mode_classifier_output'
+    );
+  }
+  if (decision[1].toLowerCase() === 'no') return { ...result, text: '<block>no</block>' };
+
+  const category = text.match(/<category>\s*([\s\S]*?)\s*<\/category>/i)?.[1]?.trim();
+  const reason = text.match(/<reason>\s*([\s\S]*?)\s*<\/reason>/i)?.[1]?.trim();
+  if (!category || !reason) {
+    throw new GatewayError(
+      'Postman 模型返回了阻止判定，但缺少 Auto mode 所需的 category 或 reason',
+      502,
+      'invalid_auto_mode_classifier_output'
+    );
+  }
+  return {
+    ...result,
+    text: `<block>yes</block><category>${category}</category><reason>${reason}</reason>`
+  };
+}
+
 function contentToText(content, options = {}) {
   const includeToolBlocks = options.includeToolBlocks !== false;
   if (typeof content === 'string') return content;
@@ -286,13 +538,20 @@ function contextAnchor(payload, protocol) {
   return sha(`${systemText(payload, protocol).slice(0, 3000)}\n${firstUserText(payload, protocol)}`);
 }
 
+function truncateSystemText(system, budget) {
+  if (system.length <= budget) return system;
+  const marker = '\n[系统提示中段已由网关截断；保留开头与末尾输出协议]\n';
+  const available = Math.max(0, budget - marker.length);
+  const tailBudget = Math.min(3000, Math.max(1200, Math.floor(available * 0.55)));
+  const headBudget = available - tailBudget;
+  return `${system.slice(0, headBudget)}${marker}${system.slice(-tailBudget)}`;
+}
+
 function fitQuery(system, user, isNewConversation) {
   let query = user.trim() || '请继续。';
   if (isNewConversation && system.trim()) {
     const systemBudget = Math.min(5600, Math.max(1800, MAX_QUERY_CHARS - Math.min(query.length, 4000) - 80));
-    const systemPart = system.length > systemBudget
-      ? `${system.slice(0, systemBudget - 36)}\n[系统提示已由网关截断]`
-      : system;
+    const systemPart = truncateSystemText(system, systemBudget);
     query = `[客户端系统提示]\n${systemPart}\n\n[用户请求]\n${query}`;
   }
   if (query.length > MAX_QUERY_CHARS) {
@@ -855,7 +1114,12 @@ function buildPostmanBody({ payload, protocol, config, workspaceId, state, toolR
     return { ...common, input };
   }
 
-  const query = fitQuery(systemText(payload, protocol), latestUserText(payload, protocol), !state.conversationId);
+  const structuredInstruction = structuredOutputInstruction(payload, protocol);
+  const classifierInstruction = autoModeClassifierInstruction(payload, protocol);
+  const userText = [latestUserText(payload, protocol), structuredInstruction, classifierInstruction]
+    .filter(Boolean)
+    .join('\n\n');
+  const query = fitQuery(systemText(payload, protocol), userText, !state.conversationId);
   return {
     ...common,
     input: {
@@ -1336,10 +1600,13 @@ function anthropicUsage(payload, result) {
 async function handleAnthropic(payload, req, res, abortController) {
   const { state, reused, toolResults } = prepareRequest(payload, 'anthropic', req);
   const stream = payload.stream === true;
+  const structured = getAnthropicStructuredOutput(payload);
   const id = `msg_postman_${crypto.randomUUID().replace(/-/g, '')}`;
   let result;
   if (!stream) {
     result = await callPostman({ payload, protocol: 'anthropic', state, toolResults }, {}, abortController.signal);
+    result = normalizeAnthropicStructuredResult(payload, result);
+    result = normalizeAnthropicAutoModeResult(payload, 'anthropic', result);
     sessionStore.completeToolResults(state, toolResults);
     sessionStore.registerResult(state, payload, 'anthropic', result);
     const content = [];
@@ -1359,6 +1626,38 @@ async function handleAnthropic(payload, req, res, abortController) {
       stop_sequence: null,
       usage: anthropicUsage(payload, result)
     });
+  }
+
+  if (structured) {
+    result = await callPostman({ payload, protocol: 'anthropic', state, toolResults }, {}, abortController.signal);
+    result = normalizeAnthropicStructuredResult(payload, result);
+    result = normalizeAnthropicAutoModeResult(payload, 'anthropic', result);
+    sessionStore.completeToolResults(state, toolResults);
+    sessionStore.registerResult(state, payload, 'anthropic', result);
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive'
+    });
+    res.write(`event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: { id, type: 'message', role: 'assistant', model: result.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: estimateTokens(requestInputText(payload, 'anthropic')), output_tokens: 0 } } })}\n\n`);
+    let nextIndex = 0;
+    if (result.text) {
+      res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: nextIndex, content_block: { type: 'text', text: '' } })}\n\n`);
+      res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: nextIndex, delta: { type: 'text_delta', text: result.text } })}\n\n`);
+      res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: nextIndex })}\n\n`);
+      nextIndex += 1;
+    }
+    for (const tool of result.toolCalls) {
+      res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: nextIndex, content_block: { type: 'tool_use', id: tool.id, name: tool.name, input: {} } })}\n\n`);
+      res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: nextIndex, delta: { type: 'input_json_delta', partial_json: tool.arguments } })}\n\n`);
+      res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: nextIndex })}\n\n`);
+      nextIndex += 1;
+    }
+    res.write(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: result.toolCalls.length ? 'tool_use' : 'end_turn', stop_sequence: null }, usage: { output_tokens: anthropicUsage(payload, result).output_tokens } })}\n\n`);
+    res.end(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+    if (DEBUG) console.log(`[Postman Gateway Debug] Anthropic structured session=${state.id.slice(0, 8)} reused=${reused}`);
+    return;
   }
 
   let started = false;
@@ -1751,6 +2050,10 @@ module.exports = {
   createServer,
   extractToolResults,
   fitQuery,
+  getAnthropicStructuredOutput,
+  isClaudeCodeAutoModeClassifier,
+  normalizeAnthropicAutoModeResult,
+  normalizeAnthropicStructuredResult,
   normalizePostmanToolCall,
   normalizeToolDefinitions,
   printHelp,
