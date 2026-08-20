@@ -266,6 +266,28 @@ function autoModeClassifierInstruction(payload, protocol) {
   ].join('\n');
 }
 
+function autoModeClassifierRepairPayload(payload, protocol) {
+  if (!isClaudeCodeAutoModeClassifier(payload, protocol)) return payload;
+  return {
+    ...payload,
+    stream: false,
+    tools: [],
+    messages: [{
+      role: 'user',
+      content: [
+        '[CLAUDE_CODE_AUTO_MODE_XML_REPAIR]',
+        'Your preceding answer could not be parsed by the safety-classification client.',
+        'Re-evaluate the same final action using the security policy already present in this conversation.',
+        'Do not execute the action and do not explain capabilities.',
+        'If allowed, reply exactly: <block>no</block>',
+        'If blocked, reply exactly: <block>yes</block><category>Exact Rule Name</category><reason>[Exact Rule Name] one short sentence</reason>',
+        'Return XML only.',
+        '[/CLAUDE_CODE_AUTO_MODE_XML_REPAIR]'
+      ].join('\n')
+    }]
+  };
+}
+
 function jsonTypeMatches(value, type) {
   if (type === 'null') return value === null;
   if (type === 'array') return Array.isArray(value);
@@ -1160,6 +1182,28 @@ async function parseSSE(stream, onEvent) {
   }
 }
 
+function postmanFailureError(failure) {
+  if (failure?.consent === false) {
+    const pathway = failure.consentPathway ? `（${failure.consentPathway}）` : '';
+    return new GatewayError(
+      `Postman 返回了 consent=false${pathway}。建议前往后台检查 AI 开启状态：https://postman.co/settings/team/ai`,
+      403,
+      'postman_agent_consent_required'
+    );
+  }
+  const details = failure?.error || failure?.cause || failure?.details || {};
+  const message = failure?.message
+    || failure?.userMessage
+    || failure?.errorMessage
+    || details.message
+    || details.userMessage
+    || (typeof failure === 'string' ? failure : '')
+    || 'Postman Chat 返回失败事件';
+  const errorType = failure?.errorType || failure?.type || failure?.code || details.errorType || details.type || details.code || 'postman_failure';
+  const status = /input|validation|too large/i.test(`${errorType} ${message}`) ? 400 : 502;
+  return new GatewayError(message, status, errorType);
+}
+
 function mergePostmanToolCall(result, raw, eventType, index) {
   if (!raw) return;
   const id = raw.id || raw.toolCallId;
@@ -1457,9 +1501,11 @@ async function callPostman({ payload, protocol, state, toolResults }, handlers =
     } else if (event.eventType === 'loopApprovalChunk') {
       result.approval = event.data || {};
     } else if (event.eventType === 'failure') {
-      const message = event.data?.message || event.data?.userMessage || 'Postman Chat 返回失败事件';
-      const status = /input|validation|too large/i.test(`${event.data?.errorType || ''} ${message}`) ? 400 : 502;
-      throw new GatewayError(message, status, event.data?.errorType || 'postman_failure');
+      const failure = event.data || {};
+      if (DEBUG) {
+        console.warn(`[Postman Gateway Debug] failure-event=${safeJson(failure).slice(0, 4000)}`);
+      }
+      throw postmanFailureError(failure);
     }
   });
   result.toolCalls = [...result.toolCallMap.values()]
@@ -1471,6 +1517,26 @@ async function callPostman({ payload, protocol, state, toolResults }, handlers =
   }
   handlers.onEnd?.(result);
   return result;
+}
+
+async function normalizeAnthropicAutoModeWithRepair(payload, result, state, signal, postmanCaller = callPostman) {
+  try {
+    return normalizeAnthropicAutoModeResult(payload, 'anthropic', result);
+  } catch (error) {
+    if (error?.code !== 'invalid_auto_mode_classifier_output') throw error;
+    if (!state?.conversationId) throw error;
+    console.warn('[Postman Gateway] Auto mode XML 无效，正在沿用同一 Postman 会话纠正一次');
+    const repairPayload = autoModeClassifierRepairPayload(payload, 'anthropic');
+    const repaired = await postmanCaller({
+      payload: repairPayload,
+      protocol: 'anthropic',
+      state,
+      toolResults: []
+    }, {}, signal);
+    const normalized = normalizeAnthropicAutoModeResult(payload, 'anthropic', repaired);
+    console.log('[Postman Gateway] Auto mode XML 同会话纠正成功');
+    return normalized;
+  }
 }
 
 function estimateTokens(text) {
@@ -1606,7 +1672,7 @@ async function handleAnthropic(payload, req, res, abortController) {
   if (!stream) {
     result = await callPostman({ payload, protocol: 'anthropic', state, toolResults }, {}, abortController.signal);
     result = normalizeAnthropicStructuredResult(payload, result);
-    result = normalizeAnthropicAutoModeResult(payload, 'anthropic', result);
+    result = await normalizeAnthropicAutoModeWithRepair(payload, result, state, abortController.signal);
     sessionStore.completeToolResults(state, toolResults);
     sessionStore.registerResult(state, payload, 'anthropic', result);
     const content = [];
@@ -1631,7 +1697,7 @@ async function handleAnthropic(payload, req, res, abortController) {
   if (structured) {
     result = await callPostman({ payload, protocol: 'anthropic', state, toolResults }, {}, abortController.signal);
     result = normalizeAnthropicStructuredResult(payload, result);
-    result = normalizeAnthropicAutoModeResult(payload, 'anthropic', result);
+    result = await normalizeAnthropicAutoModeWithRepair(payload, result, state, abortController.signal);
     sessionStore.completeToolResults(state, toolResults);
     sessionStore.registerResult(state, payload, 'anthropic', result);
 
@@ -2043,6 +2109,7 @@ if (require.main === module) {
 module.exports = {
   GatewayError,
   SessionStore,
+  autoModeClassifierRepairPayload,
   buildPostmanBody,
   buildToolSet,
   codexModelCatalog,
@@ -2053,9 +2120,11 @@ module.exports = {
   getAnthropicStructuredOutput,
   isClaudeCodeAutoModeClassifier,
   normalizeAnthropicAutoModeResult,
+  normalizeAnthropicAutoModeWithRepair,
   normalizeAnthropicStructuredResult,
   normalizePostmanToolCall,
   normalizeToolDefinitions,
+  postmanFailureError,
   printHelp,
   responseObject,
   sessionStore,

@@ -4,6 +4,24 @@
 
 This file records the features, fixes, and verification included in each release and push.
 
+## 0.2.8 — 2026-08-20
+
+### 中文
+
+- Auto mode 首次回复缺少 XML 判定时，沿用已经建立的 Postman `conversationId` 做一次短指令格式纠正。
+- 纠正请求不重放超长动作、系统提示或客户端工具，避免再次触发输入截断与身份偏移。
+- 第二次仍不符合 Claude Code XML 协议时继续失败关闭，不会默认批准。
+- 识别 Postman 12.24.2 的 `consent=false` 事件，建议用户前往 Postman 后台检查 AI 开启状态，并提供对应设置入口，不将单一信号断言为唯一根因。
+- 调试模式保留脱敏后的 Postman `failure` 事件内容，并支持提取嵌套错误详情。
+
+### English
+
+- When the first Auto mode reply lacks an XML verdict, retry once in the established Postman `conversationId` with a short format-repair turn.
+- The repair turn does not replay the oversized action, system prompt, or client tools, avoiding another truncation or persona drift.
+- If the repaired reply is still invalid, the gateway remains fail-closed and never defaults to approval.
+- Recognize Postman 12.24.2 `consent=false` events and direct users to the Postman AI settings page for verification without asserting a single root cause.
+- Preserve sanitized Postman `failure` event data in debug mode and extract nested error details.
+
 ## 0.2.7 — 2026-08-19
 
 ### 中文

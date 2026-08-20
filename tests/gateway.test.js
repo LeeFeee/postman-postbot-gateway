@@ -8,6 +8,7 @@ const test = require('node:test');
 
 const {
   SessionStore,
+  autoModeClassifierRepairPayload,
   buildPostmanBody,
   buildToolSet,
   codexModelCatalog,
@@ -16,8 +17,10 @@ const {
   getAnthropicStructuredOutput,
   isClaudeCodeAutoModeClassifier,
   normalizeAnthropicAutoModeResult,
+  normalizeAnthropicAutoModeWithRepair,
   normalizeAnthropicStructuredResult,
   normalizePostmanToolCall,
+  postmanFailureError,
   responseObject
 } = require('../postman-gateway-macos');
 
@@ -90,6 +93,105 @@ test('Auto mode XML is extracted from surrounding Postman prose', () => {
     toolCalls: []
   });
   assert.equal(blocked.text, '<block>yes</block><category>Data Exfiltration</category><reason>[Data Exfiltration] external upload</reason>');
+});
+
+test('invalid Auto mode output gets a short same-conversation XML repair turn', () => {
+  const payload = {
+    model: 'claude-sonnet-5',
+    stream: false,
+    system: 'You are a security monitor for autonomous AI coding agents.\n## Output Format\n<block>no</block>',
+    messages: [{ role: 'user', content: `Agent action ${'A'.repeat(13000)}` }]
+  };
+  const repairedPayload = autoModeClassifierRepairPayload(payload, 'anthropic');
+  assert.notEqual(repairedPayload, payload);
+  assert.deepEqual(repairedPayload.tools, []);
+  assert.equal(repairedPayload.messages.length, 1);
+  assert.match(repairedPayload.messages[0].content, /AUTO_MODE_XML_REPAIR/);
+  assert.match(repairedPayload.messages[0].content, /<block>no<\/block>/);
+
+  const body = buildPostmanBody({
+    payload: repairedPayload,
+    protocol: 'anthropic',
+    config: { models: [{ key: 'CLAUDE_46_SONNET_BEDROCK', displayName: 'Claude Sonnet 4.6' }] },
+    workspaceId: 'workspace-1',
+    state: { conversationId: 'postman-conversation-1', product: 'workspace_v12', postmanTools: [] },
+    toolResults: []
+  });
+  assert.equal(body.input.conversationId, 'postman-conversation-1');
+  assert.ok(body.input.query.length < 2000);
+  assert.match(body.input.query, /AUTO_MODE_XML_REPAIR/);
+  assert.match(body.input.query, /CLAUDE_CODE_AUTO_MODE_RESPONSE_CONTRACT/);
+  assert.doesNotMatch(body.input.query, /A{100}/);
+});
+
+test('invalid Auto mode output remains fail-closed after normalization', () => {
+  const payload = {
+    system: 'You are a security monitor for autonomous AI coding agents.\n## Output Format\n<block>no</block>'
+  };
+  assert.throws(
+    () => normalizeAnthropicAutoModeResult(payload, 'anthropic', { text: 'I cannot execute this action.', toolCalls: [] }),
+    (error) => error.code === 'invalid_auto_mode_classifier_output'
+  );
+});
+
+test('Postman Agent consent signals become a cautious troubleshooting hint', () => {
+  const error = postmanFailureError({ consent: false, consentPathway: 'USER_CAN_APPROVE_FOR_TEAM' });
+  assert.equal(error.status, 403);
+  assert.equal(error.code, 'postman_agent_consent_required');
+  assert.match(error.message, /USER_CAN_APPROVE_FOR_TEAM/);
+  assert.match(error.message, /建议前往后台检查 AI 开启状态/);
+  assert.match(error.message, /https:\/\/postman\.co\/settings\/team\/ai/);
+});
+
+test('nested Postman failure details are preserved', () => {
+  const error = postmanFailureError({ error: { message: 'upstream unavailable', code: 'upstream_error' } });
+  assert.equal(error.status, 502);
+  assert.equal(error.code, 'upstream_error');
+  assert.equal(error.message, 'upstream unavailable');
+});
+
+test('Auto mode format repair reuses state once and normalizes the repaired XML', async () => {
+  const payload = {
+    model: 'claude-sonnet-5',
+    system: 'You are a security monitor for autonomous AI coding agents.\n## Output Format\n<block>no</block>',
+    messages: [{ role: 'user', content: 'Agent(implement platform)' }]
+  };
+  const state = { conversationId: 'postman-conversation-1' };
+  let calls = 0;
+  const repaired = await normalizeAnthropicAutoModeWithRepair(
+    payload,
+    { text: 'I cannot launch an agent.', toolCalls: [] },
+    state,
+    undefined,
+    async ({ payload: repairPayload, protocol, state: repairState, toolResults }) => {
+      calls += 1;
+      assert.equal(protocol, 'anthropic');
+      assert.equal(repairState, state);
+      assert.deepEqual(toolResults, []);
+      assert.match(repairPayload.messages[0].content, /AUTO_MODE_XML_REPAIR/);
+      return { text: 'Verdict: <block>no</block>', toolCalls: [] };
+    }
+  );
+  assert.equal(calls, 1);
+  assert.equal(repaired.text, '<block>no</block>');
+});
+
+test('Auto mode repair fails closed when Postman did not establish a conversation', async () => {
+  const payload = {
+    system: 'You are a security monitor for autonomous AI coding agents.\n## Output Format\n<block>no</block>'
+  };
+  let called = false;
+  await assert.rejects(
+    normalizeAnthropicAutoModeWithRepair(
+      payload,
+      { text: 'not XML', toolCalls: [] },
+      { conversationId: null },
+      undefined,
+      async () => { called = true; }
+    ),
+    (error) => error.code === 'invalid_auto_mode_classifier_output'
+  );
+  assert.equal(called, false);
 });
 
 test('Anthropic JSON schema requirements are preserved in the Postman query', () => {
