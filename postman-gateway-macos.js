@@ -454,6 +454,9 @@ function normalizeAnthropicStructuredResult(payload, result) {
     }
   }
   if (errors.length) {
+    if (DEBUG) {
+      console.warn(`[Postman Gateway Debug] invalid-structured-output=${safeJson(String(result.text || '').slice(0, 2000))}`);
+    }
     throw new GatewayError(
       `Postman 模型未返回符合 JSON Schema 的结构化输出: ${errors[0]}`,
       502,
@@ -470,6 +473,9 @@ function normalizeAnthropicAutoModeResult(payload, protocol, result) {
   const text = String(result.text || '');
   const decision = text.match(/<block>\s*(yes|no)\s*<\/block>/i);
   if (!decision) {
+    if (DEBUG) {
+      console.warn(`[Postman Gateway Debug] invalid-auto-mode-output=${safeJson(text.slice(0, 2000))}`);
+    }
     throw new GatewayError(
       'Postman 模型未返回 Claude Code Auto mode 要求的 XML 判定',
       502,
@@ -1204,6 +1210,32 @@ function postmanFailureError(failure) {
   return new GatewayError(message, status, errorType);
 }
 
+function postmanUsageError(usage) {
+  if (String(usage?.usageState || '').toUpperCase() !== 'BLOCKED') return null;
+  const used = Number.isFinite(usage?.usage) ? usage.usage : null;
+  const limit = Number.isFinite(usage?.limit) ? usage.limit : null;
+  const amount = used !== null && limit !== null ? `，当前用量 ${used}/${limit}` : '';
+  const until = usage?.blockedUntil ? `，blockedUntil=${usage.blockedUntil}` : '';
+  const scope = usage?.isTeamPooled ? '（团队共享用量）' : '';
+  return new GatewayError(
+    `Postman AI 用量状态为 BLOCKED${scope}${amount}${until}。请前往 https://postman.co/settings/team/ai 检查用量、套餐或超额使用设置`,
+    429,
+    'postman_usage_blocked'
+  );
+}
+
+function postmanHttpError(status, text) {
+  let parsed = null;
+  try { parsed = JSON.parse(text); } catch {}
+  const message = parsed?.message || String(text || '').slice(0, 500) || `HTTP ${status}`;
+  const code = parsed?.code || parsed?.error?.code || `postman_http_${status}`;
+  return new GatewayError(
+    `Postman Chat 返回 HTTP ${status}: ${message}`,
+    status === 429 ? 429 : 502,
+    code
+  );
+}
+
 function mergePostmanToolCall(result, raw, eventType, index) {
   if (!raw) return;
   const id = raw.id || raw.toolCallId;
@@ -1459,7 +1491,7 @@ async function callPostman({ payload, protocol, state, toolResults }, handlers =
   });
   if (!response.ok) {
     const text = await response.text();
-    throw new GatewayError(`Postman Chat 返回 HTTP ${response.status}: ${text.slice(0, 500)}`, 502);
+    throw postmanHttpError(response.status, text);
   }
   if (!response.body) throw new GatewayError('Postman Chat 没有返回响应流', 502);
   handlers.onStart?.({ model: body.devModeOptions.selectedModel || config.defaultModel || payload.model || 'postbot' });
@@ -1480,6 +1512,12 @@ async function callPostman({ payload, protocol, state, toolResults }, handlers =
       event = JSON.parse(data);
     } catch {
       return;
+    }
+    if (DEBUG && event.eventType !== 'textChunk') {
+      console.log(`[Postman Gateway Debug] sse-event type=${event.eventType || 'unknown'} dataKeys=${Object.keys(event.data || {}).join(',')}`);
+      if (event.eventType === 'usage') {
+        console.log(`[Postman Gateway Debug] usage-event=${safeJson(event.data || {}).slice(0, 4000)}`);
+      }
     }
     if (event.eventType === 'conversation') {
       result.conversationId = event.data?.id || result.conversationId;
@@ -1514,6 +1552,11 @@ async function callPostman({ payload, protocol, state, toolResults }, handlers =
   delete result.toolCallMap;
   if (result.approval && !result.toolCalls.length && !result.text) {
     result.text = 'Postman 请求继续执行前需要批准，但上游未返回可供客户端执行的工具调用。请重新发送请求。';
+  }
+  if (!result.text && !result.toolCalls.length) {
+    const usageError = postmanUsageError(result.usage);
+    if (usageError) throw usageError;
+    throw new GatewayError('Postman Chat 未返回文本或工具调用', 502, 'postman_empty_response');
   }
   handlers.onEnd?.(result);
   return result;
@@ -2125,6 +2168,8 @@ module.exports = {
   normalizePostmanToolCall,
   normalizeToolDefinitions,
   postmanFailureError,
+  postmanHttpError,
+  postmanUsageError,
   printHelp,
   responseObject,
   sessionStore,

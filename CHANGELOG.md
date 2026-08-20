@@ -4,6 +4,24 @@
 
 This file records the features, fixes, and verification included in each release and push.
 
+## 0.2.9 — 2026-08-20
+
+### 中文
+
+- 识别 Postman 仅返回 `usageState=BLOCKED`、不返回模型文本的情况，明确返回 HTTP 429 用量错误。
+- 错误中显示团队共享状态、当前用量、额度上限和 `blockedUntil`，并提供 Postman AI 设置入口。
+- 避免将用量阻止误报为 Auto mode XML 或 Goal Hook JSON 格式错误，也避免流式请求显示为空回复。
+- 保留上游 HTTP 429 状态及 `http-rate-limit` 错误码，区分短时限流和周期用量阻止。
+- 调试模式记录 SSE 事件类型、用量状态及无效模型输出片段，便于定位新版 Postman 协议问题。
+
+### English
+
+- Detect Postman streams that contain only `usageState=BLOCKED` and no model output, returning an explicit HTTP 429 usage error.
+- Include pooled-team status, current usage, limit, and `blockedUntil`, with a link to Postman AI settings.
+- Prevent usage blocks from being misreported as Auto mode XML or Goal Hook JSON failures, and prevent blank streaming replies.
+- Preserve upstream HTTP 429 status and the `http-rate-limit` code to distinguish transient rate limiting from cycle usage blocks.
+- Log SSE event types, usage state, and invalid model-output snippets in debug mode for Postman protocol diagnostics.
+
 ## 0.2.8 — 2026-08-20
 
 ### 中文

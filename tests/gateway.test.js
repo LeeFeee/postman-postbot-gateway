@@ -21,6 +21,8 @@ const {
   normalizeAnthropicStructuredResult,
   normalizePostmanToolCall,
   postmanFailureError,
+  postmanHttpError,
+  postmanUsageError,
   responseObject
 } = require('../postman-gateway-macos');
 
@@ -148,6 +150,35 @@ test('nested Postman failure details are preserved', () => {
   assert.equal(error.status, 502);
   assert.equal(error.code, 'upstream_error');
   assert.equal(error.message, 'upstream unavailable');
+});
+
+test('blocked Postman usage becomes a clear 429 instead of an empty model response', () => {
+  const error = postmanUsageError({
+    usageState: 'BLOCKED',
+    usage: 800000,
+    limit: 800000,
+    allowOverage: false,
+    blockedUntil: '2026-09-19T02:16:27.000Z',
+    isTeamPooled: true
+  });
+  assert.equal(error.status, 429);
+  assert.equal(error.code, 'postman_usage_blocked');
+  assert.match(error.message, /团队共享用量/);
+  assert.match(error.message, /800000\/800000/);
+  assert.match(error.message, /2026-09-19T02:16:27\.000Z/);
+  assert.match(error.message, /postman\.co\/settings\/team\/ai/);
+  assert.equal(postmanUsageError({ usageState: 'NORMAL', usage: 10, limit: 100 }), null);
+});
+
+test('upstream HTTP 429 remains a 429 with the Postman rate-limit code', () => {
+  const error = postmanHttpError(429, JSON.stringify({
+    result: 'failure',
+    code: 'http-rate-limit',
+    message: 'Rate limit exceeded'
+  }));
+  assert.equal(error.status, 429);
+  assert.equal(error.code, 'http-rate-limit');
+  assert.match(error.message, /Rate limit exceeded/);
 });
 
 test('Auto mode format repair reuses state once and normalizes the repaired XML', async () => {
